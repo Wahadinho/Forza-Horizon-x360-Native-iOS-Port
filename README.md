@@ -10,8 +10,8 @@
 </p>
 
 > **Upstream Fork Notice:** This repository is an unofficial iOS / iPadOS fork of
-> **[Pinyon Shift](https://github.com)** by
-> [arcanite24](https://github.com), built on top of
+> **[Pinyon Shift]([https://github.com](https://github.com/arcanite24/pinyon-shift))** by
+> [arcanite24]([https://github.com](https://github.com/arcanite24)), built on top of
 > [ShiftGlue](https://github.com/shiftglue-sdk) (a fork of ReXGlue).
 > All credit for the PowerPC static recompilation, game runtime hooks, and custom
 > *Forza Horizon* Vulkan renderer goes to the upstream Pinyon Shift & ShiftGlue authors.
@@ -76,6 +76,6 @@ For full instructions, troubleshooting, and controller setup, see **[docs/IOS.md
 
 ## Credits
 
-- **[arcanite24](https://github.com)** — Creator and lead developer of [Pinyon Shift](https://github.com) and [ShiftGlue](https://github.com/shiftglue-sdk).
+- **[arcanite24]([https://github.com](https://github.com/arcanite24))** — Creator and lead developer of [Pinyon Shift]([https://github.com](https://github.com/arcanite24/pinyon-shift)) and [ShiftGlue](https://github.com/shiftglue-sdk).
 - **ReXGlue, Project Xenia, and XenonRecomp** — Foundational Xbox 360 static recompilation and emulation research.
 - **MoltenVK & SDL3** — Vulkan-to-Metal portability and iOS UIKit / input integration.
