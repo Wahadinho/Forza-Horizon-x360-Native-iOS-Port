@@ -10,8 +10,8 @@
 </p>
 
 > **Upstream Fork Notice:** This repository is an unofficial iOS / iPadOS fork of
-> **[Pinyon Shift]([https://github.com](https://github.com/arcanite24/pinyon-shift))** by
-> [arcanite24]([https://github.com](https://github.com/arcanite24)), built on top of
+> **[Pinyon Shift](https://github.com/arcanite24/pinyon-shift)** by
+> [arcanite24](https://github.com/arcanite24), built on top of
 > [ShiftGlue](https://github.com/shiftglue-sdk) (a fork of ReXGlue).
 > All credit for the PowerPC static recompilation, game runtime hooks, and custom
 > *Forza Horizon* Vulkan renderer goes to the upstream Pinyon Shift & ShiftGlue authors.
