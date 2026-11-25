@@ -1,0 +1,5177 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/math.h>
+#include <rex/platform.h>
+#include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/vulkan/util.h>
+
+#if REX_PLATFORM_ANDROID
+#include <android/data_space.h>
+#include <android/native_window.h>
+#include <rex/ui/surface_android.h>
+#include <rex/ui/vulkan/android_gpu_driver.h>
+#endif
+#if REX_PLATFORM_GNU_LINUX
+#include <rex/ui/surface_gnulinux.h>
+#endif
+#if REX_PLATFORM_WIN32
+#include <rex/ui/surface_win.h>
+#endif
+#if REX_PLATFORM_MAC
+#include <CoreGraphics/CoreGraphics.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#include <rex/ui/surface_mac.h>
+
+namespace {
+void SyncMacMetalLayerDrawableSize(const void* metal_layer, const VkExtent2D& extent) {
+  if (!metal_layer || !extent.width || !extent.height) return;
+  id layer = static_cast<id>(const_cast<void*>(metal_layer));
+  const CGSize size = reinterpret_cast<CGSize (*)(id, SEL)>(objc_msgSend)(
+      layer, sel_registerName("drawableSize"));
+  if (size.width == extent.width && size.height == extent.height) return;
+  // SDL can update the view to 1x1 after swapchain creation on fullscreen
+  // changes. Restore the extent before MoltenVK acquires its next drawable.
+  reinterpret_cast<void (*)(id, SEL, CGSize)>(objc_msgSend)(
+      layer, sel_registerName("setDrawableSize:"),
+      CGSizeMake(CGFloat(extent.width), CGFloat(extent.height)));
+}
+}  // namespace
+#endif
+
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_INT32(android_present_divisor, 0, "UI/Presenter",
+                     "Android: the swapchain is the display's size divided by this, and the "
+                     "display hardware scales it up (fewer pixels for the GPU to write each "
+                     "frame). 0 picks the largest whole divisor that still holds the game's "
+                     "output at the render scale; 1 is the display's size")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
+                    "Time the temporal upscaler on the GPU and log the mean of every 300 "
+                    "upscales");
+
+REXCVAR_DEFINE_STRING(present_upscaler_hud, "composite", "UI/Presenter",
+                      "What a temporal upscaler gets where the game draws its HUD: composite "
+                      "(the frame without the HUD, the HUD put back after the upscale), off "
+                      "(the frame with the HUD), debug (the frame without the HUD, shown so)")
+    .allowed({"composite", "off", "debug"});
+
+REXCVAR_DEFINE_BOOL(present_upscaler_camera, true, "UI/Presenter",
+                    "Give a temporal upscaler the game's depth and camera motion, taken from "
+                    "its draws (false: far depth and no motion)");
+
+REXCVAR_DEFINE_BOOL(present_upscaler_jitter, true, "UI/Presenter",
+                    "Have the game jitter the scene by a sub-pixel offset each frame for a "
+                    "temporal upscaler (with present_upscaler_camera)");
+
+REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
+                      "Show a temporal upscaler's output (upscale) or one of its inputs instead: "
+                      "depth (near white, far black) or motion (red and green around grey)")
+    .allowed({"upscale", "depth", "motion"});
+
+REXCVAR_DEFINE_STRING(present_frame_generation, "off", "UI/Presenter",
+                      "Show a generated frame between each two real ones: off, fsr3 (AMD FSR "
+                      "3.1 frame generation, needs the game's depth and camera motion), dlss "
+                      "(NVIDIA DLSS frame generation, RTX 40 and newer) or lsfg (Lossless Scaling "
+                      "frame generation from the player's Lossless.dll). The swapchain is remade "
+                      "when it is turned on")
+    .allowed({"off", "fsr3", "dlss", "lsfg"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_frame_generation_log, false, "UI/Presenter",
+                    "Debug: log present spacing and frame generation counts every 5 seconds")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(present_frame_generation_capture, 0, "UI/Presenter",
+                     "Debug: presented-output captures (present_capture_readable) show 1 the "
+                     "generated frame of each paint instead of the real one, or 2 four frames "
+                     "at half size: the previous real frame and the generated one above, the "
+                     "current real frame and the provider's output before the HUD and UI go "
+                     "back over it below")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_frame_generation_hud, true, "UI/Presenter",
+                    "Keep the game's HUD and the host UI out of frame generation: the provider "
+                    "gets the frame without them where the game's HUD can be told apart, and "
+                    "each generated frame shows the real frame's HUD and UI")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_capture_readable, false, "UI/Presenter",
+                    "Create the swapchain readable so render tests can capture the presented "
+                    "image (CapturePresentedOutput)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                    "Clear render pass during presentation");
+
+REXCVAR_DEFINE_BOOL(present_hdr, false, "UI/Presenter",
+                    "Present to an HDR swapchain (scRGB, HDR10 on Android) where the display "
+                    "offers one, with "
+                    "the SDR image at present_hdr_paper_white_nits; switching recreates the "
+                    "swapchain")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(present_hdr_paper_white_nits, 200.0, "UI/Presenter",
+                      "Brightness of SDR white on an HDR swapchain, in nits")
+    .range(80.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(present_hdr_peak_nits, 1000.0, "UI/Presenter",
+                      "The display's peak brightness on an HDR swapchain, in nits (the HDR "
+                      "calibration's last step); at or below the paper white nothing is "
+                      "expanded")
+    .range(80.0, 10000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(present_hdr_highlights, 0.5, "UI/Presenter",
+                      "How far SDR white in the scene is expanded from the paper white towards "
+                      "present_hdr_peak_nits on an HDR swapchain (0 to 1); the HUD and menus "
+                      "stay at the paper white")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(present_hdr_gamma, 2.2, "UI/Presenter",
+                      "Decode the SDR image for an HDR swapchain with this gamma, as an SDR "
+                      "display does; 0 decodes piecewise sRGB, whose linear toe lifts the "
+                      "blacks")
+    .range(0.0, 3.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_hdr_compare, false, "UI/Presenter",
+                    "On an HDR swapchain, show the left half as SDR (piecewise sRGB at the paper "
+                    "white, as Windows shows SDR content) beside the HDR right half")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(present_hdr_test_pattern, 0, "UI/Presenter",
+                     "HDR calibration pattern under the UI: 0 none, 1 black level, 2 paper "
+                     "white, 3 peak (a square at present_hdr_peak_nits in the brightest field)")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+                    "Allow immediate present mode (tears) while vsync is off");
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+                    "Allow mailbox present mode (triple buffering)");
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                    "Allow FIFO relaxed present mode (tears late frames) while vsync is off");
+
+REXCVAR_DEFINE_BOOL(vulkan_present_wait, false, "UI/Vulkan",
+                    "Pace presentation: after each present, wait (up to 50 ms) until the "
+                    "previous one has reached the display (VK_KHR_present_wait), so at most "
+                    "one present is in flight, as UnleashedRecomp paces at 120 Hz")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex {
+namespace ui {
+namespace vulkan {
+
+
+namespace {
+
+// hdr_output.ps.glsl's push constants, after the rectangle constants.
+struct HdrOutputConstants {
+  float paper_white_scale;
+  float highlight_scale;
+  float knee;
+  float knee_range_inv;
+  float gamma;
+  float max_channel_weight;
+  float compare_x;
+  uint32_t pattern;
+  float pattern_value;
+  uint32_t output_flags;
+  float size[2];
+};
+static_assert(sizeof(HdrOutputConstants) == 48);
+
+// The active HDR swapchain is HDR10 (BT.2020 PQ), not scRGB.
+std::atomic<bool> hdr_output_pq = false;
+// HDR10 through a 10-bit swapchain whose window buffers are marked BT.2020
+// PQ by hand (Android before 14 offers no HDR10 color space to Vulkan).
+std::atomic<bool> hdr_output_pq_dataspace = false;
+// The HDR swapchain is pre-rotated by this (hdr_output.ps.glsl kRotation*):
+// on a display whose panel is mounted rotated (the Odin 2 Portal's is
+// portrait), the compositor's own rotation only takes 8-bit buffers and
+// tone-maps HDR10 down to SDR before it, which washed the image out.
+std::atomic<uint32_t> hdr_output_rotation = 0;
+
+// CapturePresentedOutput: whether the current swapchain was created readable
+// (present_capture_readable, if the surface allowed it).
+std::atomic<bool> swapchain_capturable = false;
+
+VkExtent2D HdrSwapchainImageExtent(VkExtent2D extent) {
+  return hdr_output_rotation.load(std::memory_order_relaxed)
+             ? VkExtent2D{extent.height, extent.width}
+             : extent;
+}
+
+}  // namespace
+
+// Generated with `xb buildshaders`.
+namespace shaders {
+#include "../shaders/vulkan_spirv/guest_output_bilinear_dither_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_bilinear_ps.h"
+#if defined(REX_HAS_FIDELITYFX_SDK)
+#include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_cas_sharpen_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_fsr_easu_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
+#endif
+#include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
+// glslangValidator -V, from ../shaders/*.glsl.
+#include "../shaders/vulkan_spirv/frame_generation_compose_cs.h"
+#include "../shaders/vulkan_spirv/hdr_output_ps.h"
+#include "../shaders/vulkan_spirv/hdr_ui_mask_ps.h"
+#include "../shaders/vulkan_spirv/upscale_debug_view_cs.h"
+#include "../shaders/vulkan_spirv/upscale_hud_composite_cs.h"
+}  // namespace shaders
+
+VulkanPresenter::PaintContext::Submission::~Submission() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  if (draw_command_pool_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
+  }
+
+  if (acquire_semaphore_ != VK_NULL_HANDLE) {
+    dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
+  }
+  if (frame_generation_acquire_semaphore_ != VK_NULL_HANDLE) {
+    dfn.vkDestroySemaphore(device, frame_generation_acquire_semaphore_, nullptr);
+  }
+}
+
+bool VulkanPresenter::PaintContext::Submission::Initialize() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkSemaphoreCreateInfo semaphore_create_info;
+  semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  semaphore_create_info.pNext = nullptr;
+  semaphore_create_info.flags = 0;
+  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &acquire_semaphore_) !=
+          VK_SUCCESS ||
+      dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr,
+                            &frame_generation_acquire_semaphore_) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create a swapchain image acquisition "
+        "semaphore");
+    return false;
+  }
+
+  VkCommandPoolCreateInfo command_pool_create_info;
+  command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  command_pool_create_info.pNext = nullptr;
+  command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  command_pool_create_info.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+  if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr, &draw_command_pool_) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create a command pool for drawing to a "
+        "swapchain");
+    return false;
+  }
+  VkCommandBufferAllocateInfo command_buffer_allocate_info;
+  command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  command_buffer_allocate_info.pNext = nullptr;
+  command_buffer_allocate_info.commandPool = draw_command_pool_;
+  command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_buffer_allocate_info.commandBufferCount = 1;
+  if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info, &draw_command_buffer_) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to allocate a command buffer for drawing to a "
+        "swapchain");
+    return false;
+  }
+
+  return true;
+}
+
+VulkanPresenter::~VulkanPresenter() {
+  // Retirement drains drawing and presentation before releasing their objects.
+  paint_context_.DestroySwapchainAndVulkanSurface();
+
+  // Await completion of the usage of everything before destroying anything
+  // (paint submission completion already awaited).
+  // From most likely the latest to most likely the earliest to be signaled, so
+  // just one sleep will likely be needed.
+  ui_submission_tracker_.Shutdown();
+  guest_output_image_refresher_submission_tracker_.Shutdown();
+  for (std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+    upscaler->Release();
+  }
+  upscalers_.clear();
+  ReleaseFrameGenerationImages();
+  for (std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
+    generator->Release();
+  }
+  frame_generators_.clear();
+  util::DestroyAndNullHandle(vulkan_device_->functions().vkDestroyBuffer, vulkan_device_->device(),
+                             presented_capture_buffer_);
+  util::DestroyAndNullHandle(vulkan_device_->functions().vkDestroyQueryPool,
+                             vulkan_device_->device(), temporal_upscale_query_pool_);
+  util::DestroyAndNullHandle(vulkan_device_->functions().vkFreeMemory, vulkan_device_->device(),
+                             presented_capture_memory_);
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_compose_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, frame_generation_compose_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_mask_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_hud_composite_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_debug_view_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                             upscale_hud_composite_pipeline_layout_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                             upscale_hud_composite_descriptor_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                             upscale_hud_composite_set_layout_);
+
+  if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
+    dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                             paint_context_.swapchain_load_render_pass);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, paint_context_.hdr_pipeline);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, paint_context_.hdr_ui_mask_pipeline);
+  util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device, paint_context_.hdr_render_pass);
+
+  for (const PaintContext::UISetupCommandBuffer& ui_setup_command_buffer :
+       paint_context_.ui_setup_command_buffers) {
+    dfn.vkDestroyCommandPool(device, ui_setup_command_buffer.command_pool, nullptr);
+  }
+
+  for (VkFramebuffer& framebuffer : paint_context_.guest_output_intermediate_framebuffers) {
+    util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, framebuffer);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                             paint_context_.guest_output_descriptor_pool);
+  for (PaintContext::GuestOutputPaintPipeline& guest_output_paint_pipeline :
+       paint_context_.guest_output_paint_pipelines) {
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                               guest_output_paint_pipeline.swapchain_pipeline);
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                               guest_output_paint_pipeline.intermediate_pipeline);
+  }
+
+  util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                             guest_output_intermediate_render_pass_);
+  for (VkShaderModule& shader_module : guest_output_paint_fs_) {
+    util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, shader_module);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, guest_output_paint_vs_);
+  util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, hdr_output_fs_);
+  util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, hdr_ui_mask_fs_);
+  for (VkPipelineLayout& pipeline_layout : guest_output_paint_pipeline_layouts_) {
+    util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, pipeline_layout);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                             guest_output_paint_image_descriptor_set_layout_);
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureHudlessImage() {
+  return guest_output_image_ && guest_output_image_->EnsureHudless();
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_image() const {
+  return guest_output_image_ ? guest_output_image_->hudless_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_image_view() const {
+  return guest_output_image_ ? guest_output_image_->hudless_view() : VK_NULL_HANDLE;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_ever_written_previously() const {
+  return guest_output_image_ && guest_output_image_->hudless_ever_written;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHudlessWritten() {
+  if (!guest_output_image_ || !hudless_written_out_ ||
+      guest_output_image_->hudless_image() == VK_NULL_HANDLE) {
+    return;
+  }
+  guest_output_image_->hudless_ever_written = true;
+  *hudless_written_out_ = true;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureCameraImages() {
+  return guest_output_image_ && guest_output_image_->EnsureCamera();
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::depth_image() const {
+  return guest_output_image_ ? guest_output_image_->depth_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::depth_image_view() const {
+  return guest_output_image_ ? guest_output_image_->depth_view() : VK_NULL_HANDLE;
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::motion_image() const {
+  return guest_output_image_ ? guest_output_image_->motion_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::motion_image_view() const {
+  return guest_output_image_ ? guest_output_image_->motion_view() : VK_NULL_HANDLE;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::camera_ever_written_previously() const {
+  return guest_output_image_ && guest_output_image_->camera_ever_written;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetCameraWritten(
+    const UpscalerCamera& camera) {
+  if (!guest_output_image_ || !camera_out_ || !camera_written_out_ ||
+      guest_output_image_->depth_image() == VK_NULL_HANDLE) {
+    return;
+  }
+  guest_output_image_->camera_ever_written = true;
+  *camera_out_ = camera;
+  *camera_written_out_ = true;
+}
+
+bool VulkanPresenter::EnsureUpscaleHudComposite() {
+  if (upscale_hud_composite_pipeline_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (upscale_hud_composite_failed_) {
+    return false;
+  }
+  upscale_hud_composite_failed_ = true;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &upscale_hud_composite_set_layout_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite set layout");
+    return false;
+  }
+  // The debug view's constants are the larger.
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 12};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &upscale_hud_composite_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &upscale_hud_composite_pipeline_layout_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite pipeline layout");
+    return false;
+  }
+  const uint32_t set_count = uint32_t(upscale_hud_composite_sets_.size());
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * set_count},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, set_count},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = set_count;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr,
+                                 &upscale_hud_composite_descriptor_pool_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, PaintContext::kSubmissionCount> set_layouts;
+  set_layouts.fill(upscale_hud_composite_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = upscale_hud_composite_descriptor_pool_;
+  set_info.descriptorSetCount = set_count;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, upscale_hud_composite_sets_.data()) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to allocate the upscale HUD composite descriptor sets");
+    return false;
+  }
+  upscale_hud_composite_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_hud_composite_cs,
+      sizeof(shaders::upscale_hud_composite_cs));
+  upscale_debug_view_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_debug_view_cs,
+      sizeof(shaders::upscale_debug_view_cs));
+  if (upscale_hud_composite_pipeline_ == VK_NULL_HANDLE ||
+      upscale_debug_view_pipeline_ == VK_NULL_HANDLE) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite pipeline");
+    return false;
+  }
+  upscale_hud_composite_failed_ = false;
+  return true;
+}
+
+std::vector<UpscalerInfo> VulkanPresenter::GetFrameGenerators() const {
+  std::vector<UpscalerInfo> infos;
+  for (const std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
+    const FrameGeneratorInfo& source = generator->info();
+    UpscalerInfo& info = infos.emplace_back();
+    info.id = source.id;
+    info.name = source.name;
+    info.version = source.version;
+    info.kind = UpscalerKind::kTemporal;
+    info.available = source.available;
+    info.unavailable_reason = source.unavailable_reason;
+    info.uses_depth = source.uses_depth;
+    info.uses_motion_vectors = source.uses_motion_vectors;
+  }
+  return infos;
+}
+
+std::vector<UpscalerInfo> VulkanPresenter::GetUpscalers() const {
+  std::vector<UpscalerInfo> infos = GetSpatialUpscalerInfos();
+  for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+    infos.push_back(upscaler->info());
+  }
+  return infos;
+}
+
+VulkanUpscaler* VulkanPresenter::GetTemporalUpscaler(const GuestOutputPaintConfig& config) {
+  const char* id = nullptr;
+  switch (config.GetEffect()) {
+    case GuestOutputPaintConfig::Effect::kFsr2:
+      id = "fsr2";
+      break;
+    case GuestOutputPaintConfig::Effect::kFsr3:
+      id = "fsr3";
+      break;
+    case GuestOutputPaintConfig::Effect::kDlss:
+      id = "dlss";
+      break;
+    default:
+      return nullptr;
+  }
+  for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+    if (upscaler->info().id == id) {
+      return upscaler->info().available ? upscaler.get() : nullptr;
+    }
+  }
+  return nullptr;
+}
+
+uint32_t VulkanPresenter::BeginTemporalUpscaleTiming(VkCommandBuffer command_buffer,
+                                                     const VulkanUpscaler& upscaler,
+                                                     const UpscalerFrame& frame) {
+  if (!REXCVAR_GET(present_upscaler_profile)) {
+    return UINT32_MAX;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (temporal_upscale_query_pool_ == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = uint32_t(temporal_upscale_query_submissions_.size()) * 2;
+    if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &temporal_upscale_query_pool_) !=
+        VK_SUCCESS) {
+      temporal_upscale_query_pool_ = VK_NULL_HANDLE;
+      return UINT32_MAX;
+    }
+  }
+  const uint64_t submission = paint_context_.guest_output_image_paint_last_submission;
+  const uint32_t slot = uint32_t(submission % temporal_upscale_query_submissions_.size());
+  // The slot's previous result, once its paint has completed.
+  uint64_t& slot_submission = temporal_upscale_query_submissions_[slot];
+  if (slot_submission &&
+      slot_submission <= paint_context_.submission_tracker.UpdateAndGetCompletedSubmission()) {
+    uint64_t timestamps[2];
+    if (dfn.vkGetQueryPoolResults(device, temporal_upscale_query_pool_, slot * 2, 2,
+                                  sizeof(timestamps), timestamps, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        timestamps[1] >= timestamps[0]) {
+      temporal_upscale_gpu_ns_ +=
+          double(timestamps[1] - timestamps[0]) * vulkan_device_->properties().timestampPeriod;
+      if (++temporal_upscale_gpu_samples_ == 300) {
+        REXLOG_INFO("VulkanPresenter: {} {} upscale {}x{} to {}x{}: {:.3f} ms GPU (mean of 300)",
+                    upscaler.info().id, upscaler.info().version, frame.render_width,
+                    frame.render_height, frame.output_width, frame.output_height,
+                    temporal_upscale_gpu_ns_ / 300.0 / 1.0e6);
+        temporal_upscale_gpu_ns_ = 0.0;
+        temporal_upscale_gpu_samples_ = 0;
+      }
+    }
+  }
+  slot_submission = 0;
+  dfn.vkCmdResetQueryPool(command_buffer, temporal_upscale_query_pool_, slot * 2, 2);
+  // Both stamps at the bottom of the pipe: the span of the upscale's own work.
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          temporal_upscale_query_pool_, slot * 2);
+  return slot;
+}
+
+bool VulkanPresenter::DispatchTemporalUpscaler(
+    VkCommandBuffer command_buffer, VulkanUpscaler& upscaler, VkImage source_image,
+    VkImageView source_view, uint32_t source_width, uint32_t source_height, VkImage output_image,
+    VkImageView output_view, uint32_t output_width, uint32_t output_height,
+    uint64_t guest_output_refresh_serial, const GuestOutputPaintConfig& config,
+    const GuestOutputImage* camera_source, const UpscalerCamera* camera) {
+  TemporalUpscaleState& state = temporal_upscale_;
+  const bool same_target = state.output_valid && state.upscaler == &upscaler &&
+                           state.output_image == output_image &&
+                           state.source_width == source_width &&
+                           state.source_height == source_height &&
+                           state.output_width == output_width &&
+                           state.output_height == output_height;
+  if (!same_target) {
+    // Nothing that recreated the target can be in flight in this paint, but
+    // the previous provider resources may be: wait for painting to finish
+    // before Prepare replaces them.
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(
+        paint_context_.guest_output_image_paint_last_submission - 1);
+  }
+  if (!upscaler.Prepare(source_width, source_height, output_width, output_height, false)) {
+    state.output_valid = false;
+    return false;
+  }
+
+  const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  UpscalerFrame frame;
+  frame.render_width = source_width;
+  frame.render_height = source_height;
+  frame.output_width = output_width;
+  frame.output_height = output_height;
+  frame.motion_vector_scale_x = float(source_width);
+  frame.motion_vector_scale_y = float(source_height);
+  // The real time between guest frames, bounded so a pause or a hitch does
+  // not read as a jump in the provider's history weighting.
+  frame.frame_delta_ms =
+      same_target && state.last_dispatch_us
+          ? std::clamp(float(now_us - state.last_dispatch_us) / 1000.0f, 1.0f, 100.0f)
+          : 16.667f;
+  // The history is dropped only when it cannot be continued: a new provider,
+  // source or output size, or a recreated output image.
+  frame.reset = !same_target || (camera && camera->cut);
+  if (camera) {
+    frame.camera_near = camera->near_plane;
+    frame.camera_far = camera->far_plane;
+    frame.camera_fov_y = camera->fov_y;
+    frame.jitter_x = camera->jitter_x;
+    frame.jitter_y = camera->jitter_y;
+  }
+  frame.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
+
+  VulkanUpscalerInputs inputs;
+  constexpr VkImageUsageFlags kGuestOutputUsage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  inputs.color = {source_image, source_view, kGuestOutputFormat, source_width, source_height,
+                  kGuestOutputUsage};
+  inputs.output = {output_image, output_view, kGuestOutputFormat, output_width, output_height,
+                   kGuestOutputUsage};
+  if (camera_source) {
+    constexpr VkImageUsageFlags kCameraUsage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    inputs.depth = {camera_source->depth_image(), camera_source->depth_view(),
+                    kGuestOutputDepthFormat, source_width, source_height, kCameraUsage};
+    inputs.motion_vectors = {camera_source->motion_image(), camera_source->motion_view(),
+                             kGuestOutputMotionFormat, source_width, source_height,
+                             kCameraUsage};
+  }
+  inputs.frame = frame;
+  const uint32_t query_slot = BeginTemporalUpscaleTiming(command_buffer, upscaler, frame);
+  if (!upscaler.Dispatch(command_buffer, inputs)) {
+    state.output_valid = false;
+    return false;
+  }
+  if (query_slot != UINT32_MAX) {
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            temporal_upscale_query_pool_, query_slot * 2 + 1);
+    temporal_upscale_query_submissions_[query_slot] =
+        paint_context_.guest_output_image_paint_last_submission;
+  }
+  state.upscaler = &upscaler;
+  state.output_image = output_image;
+  state.source_width = source_width;
+  state.source_height = source_height;
+  state.output_width = output_width;
+  state.output_height = output_height;
+  state.refresh_serial = guest_output_refresh_serial;
+  state.last_dispatch_us = now_us;
+  state.output_valid = true;
+  ++state.dispatch_count;
+  if (frame.reset) {
+    ++state.reset_count;
+  }
+  if ((state.dispatch_count & 1023) == 0) {
+    REXLOG_DEBUG("VulkanPresenter: {} temporal upscales, {} history resets, {} repeated paints",
+                 state.dispatch_count, state.reset_count, state.repeat_count);
+  }
+  return true;
+}
+
+void VulkanPresenter::ReleaseFrameGenerationImages() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  for (FrameGenerationImage* image :
+       {&frame_generation_.color, &frame_generation_.output, &frame_generation_.final,
+        &frame_generation_.previous, &frame_generation_.debug}) {
+    util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
+    util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
+    util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
+  }
+  frame_generation_.previous_valid = false;
+  frame_generation_.input_recorded = false;
+  frame_generation_.extent = {};
+}
+
+namespace {
+
+constexpr VkImageUsageFlags kFrameGenerationImageUsage =
+    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+VkImageMemoryBarrier FrameGenerationBarrier(VkImage image, VkAccessFlags src_access,
+                                            VkAccessFlags dst_access, VkImageLayout old_layout,
+                                            VkImageLayout new_layout) {
+  VkImageMemoryBarrier b = {};
+  b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  b.srcAccessMask = src_access;
+  b.dstAccessMask = dst_access;
+  b.oldLayout = old_layout;
+  b.newLayout = new_layout;
+  b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = image;
+  b.subresourceRange = util::InitializeSubresourceRange();
+  return b;
+}
+
+// Everything painting may have done to an image before a copy.
+constexpr VkPipelineStageFlags kFrameGenerationAnyStage =
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+constexpr VkAccessFlags kFrameGenerationAnyAccess =
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+struct FrameGenerationComposeConstants {
+  uint32_t output_size[2];
+  int32_t rect_offset[2];
+  float rect_size_inv[2];
+  float source_uv_scale[2];
+  uint32_t mode;
+  float threshold;
+};
+static_assert(sizeof(FrameGenerationComposeConstants) == sizeof(uint32_t) * 10);
+
+}  // namespace
+
+VulkanFrameGenerator* VulkanPresenter::GetFrameGenerator() const {
+  if (!paint_context_.swapchain_frame_generation) {
+    return nullptr;
+  }
+  const std::string& id = REXCVAR_GET(present_frame_generation);
+  if (id == "off") {
+    return nullptr;
+  }
+  for (const std::unique_ptr<VulkanFrameGenerator>& candidate : frame_generators_) {
+    if (candidate->info().id == id && candidate->info().available) {
+      return candidate.get();
+    }
+  }
+  return nullptr;
+}
+
+VkImage VulkanPresenter::GetPaintTargetImage(uint32_t swapchain_image_index) const {
+  return paint_context_.swapchain_hdr ? paint_context_.hdr_images[swapchain_image_index].image
+                                      : paint_context_.swapchain_images[swapchain_image_index];
+}
+
+VkImageLayout VulkanPresenter::GetPaintTargetLayout() const {
+  return paint_context_.swapchain_hdr ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                      : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+}
+
+bool VulkanPresenter::EnsureFrameGenerationImages(VulkanFrameGenerator* generator) {
+  FrameGenerationState& state = frame_generation_;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  const VkExtent2D extent = paint_context_.swapchain_extent;
+  const bool debug = REXCVAR_GET(present_frame_generation_capture) == 2;
+  const bool rebuild = state.generator != generator || state.extent.width != extent.width ||
+                       state.extent.height != extent.height || state.color.image == VK_NULL_HANDLE;
+  if (!rebuild && (!debug || state.debug.image != VK_NULL_HANDLE)) {
+    return true;
+  }
+  paint_context_.submission_tracker.AwaitSubmissionCompletion(state.last_image_submission);
+  if (rebuild) {
+    if (state.generator && state.generator != generator) {
+      state.generator->Release();
+    }
+    ReleaseFrameGenerationImages();
+    state.generator = generator;
+    state.reset = true;
+  }
+  auto create = [&](FrameGenerationImage& image) {
+    if (image.image != VK_NULL_HANDLE) {
+      return true;
+    }
+    VkImageCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    create_info.imageType = VK_IMAGE_TYPE_2D;
+    create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    create_info.extent = {extent.width, extent.height, 1};
+    create_info.mipLevels = 1;
+    create_info.arrayLayers = 1;
+    create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    create_info.usage = kFrameGenerationImageUsage;
+    create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = create_info.format;
+    view_info.subresourceRange = util::InitializeSubresourceRange();
+    if (!util::CreateDedicatedAllocationImage(vulkan_device_, create_info,
+                                              util::MemoryPurpose::kDeviceLocal, image.image,
+                                              image.memory)) {
+      return false;
+    }
+    view_info.image = image.image;
+    return dfn.vkCreateImageView(device, &view_info, nullptr, &image.view) == VK_SUCCESS;
+  };
+  bool created = create(state.color) && create(state.output) && create(state.final);
+  if (created && debug) {
+    created = create(state.previous) && create(state.debug);
+    state.previous_valid = false;
+  }
+  if (!created) {
+    REXLOG_ERROR("VulkanPresenter: could not create the frame generation images");
+    ReleaseFrameGenerationImages();
+    ++state.failed;
+    ++state.total_failed;
+    return false;
+  }
+  state.extent = extent;
+  return true;
+}
+
+bool VulkanPresenter::EnsureFrameGenerationCompose() {
+  if (frame_generation_compose_pipeline_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (frame_generation_compose_failed_ || !EnsureUpscaleHudComposite()) {
+    return false;
+  }
+  frame_generation_compose_failed_ = true;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  const uint32_t set_count = uint32_t(frame_generation_compose_sets_.size());
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * set_count},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, set_count},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = set_count;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &frame_generation_compose_pool_) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the frame generation compose pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, std::tuple_size_v<decltype(frame_generation_compose_sets_)>>
+      set_layouts;
+  set_layouts.fill(upscale_hud_composite_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = frame_generation_compose_pool_;
+  set_info.descriptorSetCount = set_count;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, frame_generation_compose_sets_.data()) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to allocate the frame generation compose sets");
+    return false;
+  }
+  frame_generation_compose_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::frame_generation_compose_cs,
+      sizeof(shaders::frame_generation_compose_cs));
+  if (frame_generation_compose_pipeline_ == VK_NULL_HANDLE) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the frame generation compose pipeline");
+    return false;
+  }
+  frame_generation_compose_failed_ = false;
+  return true;
+}
+
+void VulkanPresenter::DispatchFrameGenerationCompose(VkCommandBuffer command_buffer,
+                                                     VkDescriptorSet set, VkImageView frame_view,
+                                                     VkImageView hudless_view,
+                                                     VkImageView target_view,
+                                                     const uint32_t constants[10]) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkSampler linear_sampler =
+      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+  VkDescriptorImageInfo images[3] = {
+      {linear_sampler, frame_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {linear_sampler, hudless_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, target_view, VK_IMAGE_LAYOUT_GENERAL},
+  };
+  VkWriteDescriptorSet writes[3] = {};
+  for (uint32_t j = 0; j < 3; ++j) {
+    writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[j].dstSet = set;
+    writes[j].dstBinding = j;
+    writes[j].descriptorCount = 1;
+    writes[j].descriptorType =
+        j == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[j].pImageInfo = &images[j];
+  }
+  dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, writes, 0, nullptr);
+  dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        frame_generation_compose_pipeline_);
+  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              upscale_hud_composite_pipeline_layout_, 0, 1, &set, 0, nullptr);
+  dfn.vkCmdPushConstants(command_buffer, upscale_hud_composite_pipeline_layout_,
+                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 10, constants);
+  dfn.vkCmdDispatch(command_buffer, (constants[0] + 15) / 16, (constants[1] + 7) / 8, 1);
+}
+
+void VulkanPresenter::RecordFrameGenerationInput(VkCommandBuffer command_buffer,
+                                                 uint32_t swapchain_image_index,
+                                                 const FrameGenerationHud* hud,
+                                                 uint64_t submission_index) {
+  FrameGenerationState& state = frame_generation_;
+  state.input_recorded = false;
+  VulkanFrameGenerator* generator = GetFrameGenerator();
+  if (!generator || !EnsureFrameGenerationImages(generator)) {
+    return;
+  }
+  if (hud && !EnsureFrameGenerationCompose()) {
+    hud = nullptr;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkExtent2D extent = state.extent;
+  const VkImage target = GetPaintTargetImage(swapchain_image_index);
+  const VkImageLayout target_layout = GetPaintTargetLayout();
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[1] = {int32_t(extent.width), int32_t(extent.height), 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.dstOffsets[1] = blit.srcOffsets[1];
+
+  // The painted frame, without the host UI (and the HUD when deferred), as
+  // the provider's input; with the HUD deferred, also into the output image,
+  // which is free until the provider writes it, to draw the HUD over.
+  {
+    VkImageMemoryBarrier barriers[3] = {
+        FrameGenerationBarrier(target, kFrameGenerationAnyAccess, VK_ACCESS_TRANSFER_READ_BIT,
+                               target_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        FrameGenerationBarrier(state.color.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        FrameGenerationBarrier(state.output.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer, kFrameGenerationAnyStage,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             hud ? 3 : 2, barriers);
+  }
+  dfn.vkCmdBlitImage(command_buffer, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     state.color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     VK_FILTER_NEAREST);
+  if (hud) {
+    dfn.vkCmdBlitImage(command_buffer, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+    const VkImageMemoryBarrier to_compute =
+        FrameGenerationBarrier(state.output.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_compute);
+    FrameGenerationComposeConstants constants = {};
+    constants.output_size[0] = extent.width;
+    constants.output_size[1] = extent.height;
+    constants.rect_offset[0] = hud->rect_x;
+    constants.rect_offset[1] = hud->rect_y;
+    constants.rect_size_inv[0] = 1.0f / float(std::max(hud->rect_width, 1u));
+    constants.rect_size_inv[1] = 1.0f / float(std::max(hud->rect_height, 1u));
+    constants.source_uv_scale[0] = hud->source_uv_scale[0];
+    constants.source_uv_scale[1] = hud->source_uv_scale[1];
+    constants.mode = 0;
+    DispatchFrameGenerationCompose(
+        command_buffer,
+        frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) * 2],
+        hud->frame_view, hud->hudless_view, state.output.view,
+        reinterpret_cast<const uint32_t*>(&constants));
+    const VkImageMemoryBarrier barriers[2] = {
+        FrameGenerationBarrier(state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        FrameGenerationBarrier(target, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+    dfn.vkCmdBlitImage(command_buffer, state.output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+  }
+  {
+    const VkImageMemoryBarrier barriers[2] = {
+        FrameGenerationBarrier(
+            target, hud ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            hud ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            target_layout),
+        FrameGenerationBarrier(state.color.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 2, barriers);
+  }
+  state.last_image_submission = submission_index;
+  state.input_recorded = true;
+  state.input_hudless = hud != nullptr;
+}
+
+bool VulkanPresenter::RecordFrameGeneration(
+    VkCommandBuffer command_buffer, VkSemaphore acquire_semaphore, uint32_t swapchain_image_index,
+    const GuestOutputImage* guest_output_image, uint64_t guest_output_refresh_serial,
+    const UpscalerCamera* camera, uint32_t render_width, uint32_t render_height,
+    uint64_t submission_index, uint32_t& generated_image_index_out) {
+  FrameGenerationState& state = frame_generation_;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  // Only good for this paint.
+  const bool input_recorded = state.input_recorded;
+  state.input_recorded = false;
+
+  const std::string& id = REXCVAR_GET(present_frame_generation);
+  VulkanFrameGenerator* generator = GetFrameGenerator();
+  if (!generator) {
+    frame_generating_.store(false, std::memory_order_relaxed);
+    if (state.generator) {
+      paint_context_.submission_tracker.AwaitSubmissionCompletion(state.last_image_submission);
+      state.generator->Release();
+      ReleaseFrameGenerationImages();
+      state.generator = nullptr;
+      state.reset = true;
+    }
+    state.waiting = id == "off" ? std::string()
+                    : !paint_context_.swapchain_frame_generation
+                        ? std::string("restart to turn it on")
+                        : std::string("unavailable");
+    if (id != "off" && !state.logged_unusable) {
+      state.logged_unusable = true;
+      REXLOG_WARN(
+          "VulkanPresenter: frame generation {} is not used: {}", id,
+          paint_context_.swapchain_frame_generation
+              ? "the provider is unavailable"
+              : "the swapchain was made without it (restart) or cannot be copied");
+    }
+    return false;
+  }
+  // A repaint of the same guest frame (a window event, a faster display)
+  // shows it again without a generated frame.
+  if (guest_output_refresh_serial == state.refresh_serial) {
+    ++state.skipped_repeat;
+    return false;
+  }
+  state.refresh_serial = guest_output_refresh_serial;
+  state.render_width = render_width;
+  state.render_height = render_height;
+  const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  float delta_ms = 16.667f;
+  if (state.last_real_us) {
+    delta_ms = std::clamp(float(now_us - state.last_real_us) / 1000.0f, 1.0f, 100.0f);
+    state.interval_ms =
+        state.interval_ms > 0.0f ? state.interval_ms * 0.9f + delta_ms * 0.1f : delta_ms;
+  }
+  state.last_real_us = now_us;
+  const bool needs_camera =
+      generator->info().uses_depth || generator->info().uses_motion_vectors;
+  if (!guest_output_image ||
+      (needs_camera && (!camera || guest_output_image->depth_image() == VK_NULL_HANDLE ||
+                        guest_output_image->motion_image() == VK_NULL_HANDLE))) {
+    // Menus and frames without a scene: the next generated frame starts over,
+    // and the game may render at the full rate again.
+    frame_generating_.store(false, std::memory_order_relaxed);
+    ++state.skipped_no_camera;
+    state.reset = true;
+    state.waiting = "no scene";
+    return false;
+  }
+  if (!EnsureFrameGenerationImages(generator)) {
+    state.reset = true;
+    state.waiting = "no memory for its images";
+    return false;
+  }
+  const VkExtent2D extent = state.extent;
+  const VkExtent2D source_extent = guest_output_image->extent();
+  if (!generator->Prepare(extent.width, extent.height, source_extent.width,
+                          source_extent.height)) {
+    ++state.failed;
+    ++state.total_failed;
+    state.reset = true;
+    state.waiting = "the provider could not start";
+    return false;
+  }
+
+  // The second image, for the generated frame.
+  uint32_t generated_index = 0;
+  const VkResult acquired =
+      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(10000000),
+                                acquire_semaphore, VK_NULL_HANDLE, &generated_index);
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+    ++state.skipped_no_image;
+    state.reset = true;
+    state.waiting = "no swapchain image";
+    return false;
+  }
+
+  const VkImage real_target = GetPaintTargetImage(swapchain_image_index);
+  const VkImage generated_target = GetPaintTargetImage(generated_index);
+  const VkImageLayout target_layout = GetPaintTargetLayout();
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[1] = {int32_t(extent.width), int32_t(extent.height), 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.dstOffsets[1] = blit.srcOffsets[1];
+
+  // The finished real frame (its HUD and UI included), and, when painting
+  // did not copy one before the UI, the provider's input from it too.
+  {
+    const VkImageMemoryBarrier barriers[3] = {
+        FrameGenerationBarrier(real_target, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_READ_BIT, target_layout,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        FrameGenerationBarrier(state.final.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        FrameGenerationBarrier(state.color.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer, kFrameGenerationAnyStage,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             input_recorded ? 2 : 3, barriers);
+  }
+  dfn.vkCmdBlitImage(command_buffer, real_target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     state.final.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     VK_FILTER_NEAREST);
+  if (!input_recorded) {
+    dfn.vkCmdBlitImage(command_buffer, real_target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+  }
+  {
+    const VkImageMemoryBarrier barriers[4] = {
+        FrameGenerationBarrier(real_target, VK_ACCESS_TRANSFER_READ_BIT, 0,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_layout),
+        FrameGenerationBarrier(state.final.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+        FrameGenerationBarrier(state.output.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_GENERAL),
+        FrameGenerationBarrier(state.color.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+    };
+    // With the input recorded earlier, the input is already in the read
+    // layout: no barrier for it.
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, input_recorded ? 3 : 4, barriers);
+  }
+
+  constexpr VkImageUsageFlags kCameraUsage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  VulkanFrameGeneratorInputs inputs;
+  inputs.present_color = {state.color.image, state.color.view, VK_FORMAT_R8G8B8A8_UNORM,
+                          extent.width,      extent.height,    kFrameGenerationImageUsage};
+  inputs.output = {state.output.image, state.output.view, VK_FORMAT_R8G8B8A8_UNORM,
+                   extent.width,       extent.height,     kFrameGenerationImageUsage};
+  UpscalerFrame& frame = inputs.frame;
+  frame.render_width = render_width;
+  frame.render_height = render_height;
+  frame.output_width = extent.width;
+  frame.output_height = extent.height;
+  frame.motion_vector_scale_x = float(render_width);
+  frame.motion_vector_scale_y = float(render_height);
+  frame.frame_delta_ms = delta_ms;
+  frame.reset = state.reset;
+  if (needs_camera) {
+    inputs.depth = {guest_output_image->depth_image(), guest_output_image->depth_view(),
+                    kGuestOutputDepthFormat,           render_width,
+                    render_height,                     kCameraUsage};
+    inputs.motion_vectors = {guest_output_image->motion_image(),
+                             guest_output_image->motion_view(),
+                             kGuestOutputMotionFormat,
+                             render_width,
+                             render_height,
+                             kCameraUsage};
+    frame.reset = frame.reset || camera->cut;
+    frame.camera_near = camera->near_plane;
+    frame.camera_far = camera->far_plane;
+    frame.camera_fov_y = camera->fov_y;
+    frame.jitter_x = camera->jitter_x;
+    frame.jitter_y = camera->jitter_y;
+  }
+  inputs.frame_id = ++state.frame_id;
+  // The painted guest output, clipped to the swapchain.
+  inputs.generation_width = extent.width;
+  inputs.generation_height = extent.height;
+  if (const std::optional<GuestOutputRect> rect = GetPaintedGuestOutputRectFromUIThread()) {
+    const int32_t x0 = std::clamp(rect->x, 0, int32_t(extent.width));
+    const int32_t y0 = std::clamp(rect->y, 0, int32_t(extent.height));
+    const int32_t x1 = std::clamp(rect->x + int32_t(rect->width), x0, int32_t(extent.width));
+    const int32_t y1 = std::clamp(rect->y + int32_t(rect->height), y0, int32_t(extent.height));
+    if (x1 > x0 && y1 > y0) {
+      inputs.generation_x = x0;
+      inputs.generation_y = y0;
+      inputs.generation_width = uint32_t(x1 - x0);
+      inputs.generation_height = uint32_t(y1 - y0);
+    }
+  }
+  const bool generated = generator->Dispatch(command_buffer, inputs);
+  const int32_t capture_mode = REXCVAR_GET(present_frame_generation_capture);
+  const bool debug_grid = generated && capture_mode == 2 && !paint_context_.swapchain_hdr &&
+                          state.debug.image != VK_NULL_HANDLE;
+  // The debug grid's quarters: previous real, generated / real, raw output.
+  auto quarter = [&](uint32_t qx, uint32_t qy) {
+    VkImageBlit q = blit;
+    q.dstOffsets[0] = {int32_t(extent.width / 2 * qx), int32_t(extent.height / 2 * qy), 0};
+    q.dstOffsets[1] = {int32_t(extent.width / 2 * (qx + 1)),
+                       int32_t(extent.height / 2 * (qy + 1)), 1};
+    return q;
+  };
+  if (debug_grid) {
+    const VkImageMemoryBarrier barriers[2] = {
+        FrameGenerationBarrier(state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        FrameGenerationBarrier(state.debug.image, kFrameGenerationAnyAccess,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+    const VkImageBlit q = quarter(1, 1);
+    dfn.vkCmdBlitImage(command_buffer, state.output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.debug.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &q,
+                       VK_FILTER_LINEAR);
+    const VkImageMemoryBarrier back = FrameGenerationBarrier(
+        state.output.image, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &back);
+  }
+  // The real frame's HUD and host UI over the generated frame: where the
+  // finished frame's alpha (the HUD's coverage from the guest output, the
+  // UI's added by its blending) is set.
+  // Only where painting recorded the input before the UI: the alpha is the
+  // coverage then, not the opaque alpha of the effects.
+  if (generated && input_recorded && EnsureFrameGenerationCompose()) {
+    const VkImageMemoryBarrier to_compose = FrameGenerationBarrier(
+        state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_GENERAL);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_compose);
+    FrameGenerationComposeConstants constants = {};
+    constants.output_size[0] = extent.width;
+    constants.output_size[1] = extent.height;
+    constants.mode = 1;
+    // Above rounding noise in an 8-bit alpha.
+    constants.threshold = 1.5f / 255.0f;
+    DispatchFrameGenerationCompose(
+        command_buffer,
+        frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) * 2 +
+                                       1],
+        state.final.view, state.final.view, state.output.view,
+        reinterpret_cast<const uint32_t*>(&constants));
+  }
+
+  // The generated frame, or the real one again if the provider recorded
+  // nothing, into the second image: it was acquired and must be presented.
+  const VkImage source = generated ? state.output.image : state.final.image;
+  {
+    const VkImageMemoryBarrier barriers[2] = {
+        generated ? FrameGenerationBarrier(state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                  : FrameGenerationBarrier(state.final.image, VK_ACCESS_SHADER_READ_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        FrameGenerationBarrier(generated_target, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+  }
+  dfn.vkCmdBlitImage(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     generated_target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     VK_FILTER_NEAREST);
+  if (debug_grid) {
+    // The rest of the grid, then the finished real frame kept for the next.
+    const VkImageMemoryBarrier to_read = FrameGenerationBarrier(
+        state.final.image, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_read);
+    VkImageBlit q = quarter(1, 0);
+    dfn.vkCmdBlitImage(command_buffer, state.output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.debug.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &q,
+                       VK_FILTER_LINEAR);
+    q = quarter(0, 1);
+    dfn.vkCmdBlitImage(command_buffer, state.final.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.debug.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &q,
+                       VK_FILTER_LINEAR);
+    if (state.previous_valid) {
+      q = quarter(0, 0);
+      dfn.vkCmdBlitImage(command_buffer, state.previous.image,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, state.debug.image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &q, VK_FILTER_LINEAR);
+    }
+    const VkImageMemoryBarrier barriers[2] = {
+        FrameGenerationBarrier(state.previous.image, VK_ACCESS_TRANSFER_READ_BIT,
+                               VK_ACCESS_TRANSFER_WRITE_BIT,
+                               state.previous_valid ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                    : VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        FrameGenerationBarrier(state.debug.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+    };
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             barriers);
+    dfn.vkCmdBlitImage(command_buffer, state.final.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       state.previous.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+    const VkImageMemoryBarrier previous_done = FrameGenerationBarrier(
+        state.previous.image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &previous_done);
+    state.previous_valid = true;
+  }
+  // Debug: the generated frame (or the grid) replaces the real one in the
+  // presented capture that painting recorded earlier in this command buffer.
+  if (generated && capture_mode != 0 && !paint_context_.swapchain_hdr) {
+    std::unique_lock<std::mutex> lock(presented_capture_mutex_, std::try_to_lock);
+    if (lock.owns_lock() && presented_capture_written_ &&
+        presented_capture_buffer_ != VK_NULL_HANDLE &&
+        presented_capture_buffer_extent_.width == extent.width &&
+        presented_capture_buffer_extent_.height == extent.height &&
+        presented_capture_buffer_pixel_size_ == 4) {
+      VkBufferMemoryBarrier buffer_barrier = {};
+      buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+      buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      buffer_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.buffer = presented_capture_buffer_;
+      buffer_barrier.size = VK_WHOLE_SIZE;
+      dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &buffer_barrier,
+                               0, nullptr);
+      VkBufferImageCopy copy = {};
+      copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      copy.imageSubresource.layerCount = 1;
+      copy.imageExtent = {extent.width, extent.height, 1};
+      dfn.vkCmdCopyImageToBuffer(command_buffer,
+                                 debug_grid ? state.debug.image : state.output.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, presented_capture_buffer_, 1,
+                                 &copy);
+      buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &buffer_barrier, 0,
+                               nullptr);
+      presented_capture_format_ = VK_FORMAT_R8G8B8A8_UNORM;
+    }
+  }
+  {
+    const VkImageMemoryBarrier to_present = FrameGenerationBarrier(
+        generated_target, VK_ACCESS_TRANSFER_WRITE_BIT,
+        paint_context_.swapchain_hdr ? VK_ACCESS_SHADER_READ_BIT : VkAccessFlags(0),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             paint_context_.swapchain_hdr ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                                          : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_present);
+  }
+  state.last_image_submission = submission_index;
+  frame_generating_.store(generated, std::memory_order_relaxed);
+  if (generated) {
+    ++state.generated;
+    state.reset = false;
+    state.waiting.clear();
+  } else {
+    ++state.failed;
+    ++state.total_failed;
+    state.reset = true;
+    state.waiting = "warming up";
+  }
+  generated_image_index_out = generated_index;
+  return true;
+}
+
+void VulkanPresenter::NoteFrameGenerationPresent(bool generated) {
+  FrameGenerationState& state = frame_generation_;
+  const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  if (state.last_present_us) {
+    const double ms = double(now_us - state.last_present_us) / 1000.0;
+    ++state.presents;
+    state.present_ms_sum += ms;
+    state.present_ms_max = std::max(state.present_ms_max, ms);
+    ++state.present_buckets[ms < 12.0 ? 0 : ms < 22.0 ? 1 : ms < 40.0 ? 2 : 3];
+  }
+  state.last_present_us = now_us;
+  if (generated) {
+    ++state.presents_generated;
+  }
+  if (!state.last_log_us) {
+    state.last_log_us = now_us;
+  }
+  if (now_us - state.last_log_us < 5000000 || !REXCVAR_GET(present_frame_generation_log)) {
+    return;
+  }
+  const double seconds = double(now_us - state.last_log_us) / 1000000.0;
+  state.last_log_us = now_us;
+  REXLOG_INFO(
+      "VulkanPresenter: frame generation {} ({}): {:.1f} presents/s ({} generated), interval "
+      "mean {:.2f} max {:.2f} ms, <12: {}, 12-22: {}, 22-40: {}, >40: {}; dispatched {} "
+      "(failed {}), skipped: repeat {}, no camera {}, no size {}, no image {}; real every "
+      "{:.2f} ms, generated-to-real gap {:.2f} ms",
+      REXCVAR_GET(present_frame_generation),
+      state.generator ? state.generator->info().version : std::string("-"),
+      double(state.presents) / seconds, state.presents_generated,
+      state.presents ? state.present_ms_sum / double(state.presents) : 0.0, state.present_ms_max,
+      state.present_buckets[0], state.present_buckets[1], state.present_buckets[2],
+      state.present_buckets[3], state.generated, state.failed, state.skipped_repeat,
+      state.skipped_no_camera, state.skipped_no_size, state.skipped_no_image, state.interval_ms,
+      state.presents_generated ? state.gap_ms_sum / double(state.presents_generated) : 0.0);
+  state.generated = state.failed = state.skipped_no_camera = state.skipped_no_image = 0;
+  state.skipped_repeat = state.skipped_no_size = 0;
+  state.presents = state.presents_generated = 0;
+  state.present_ms_sum = state.present_ms_max = state.gap_ms_sum = 0.0;
+  for (uint64_t& bucket : state.present_buckets) {
+    bucket = 0;
+  }
+}
+
+Presenter::PresentStats VulkanPresenter::GetPresentStatsFromUIThread() const {
+  PresentStats stats;
+  const FrameGenerationState& state = frame_generation_;
+  stats.real_presents = state.total_real_presents;
+  stats.generated_presents = state.total_generated_presents;
+  stats.generation_failures = state.total_failed;
+  const std::string& id = REXCVAR_GET(present_frame_generation);
+  if (id != "off") {
+    stats.frame_generation = id;
+    for (const std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
+      if (generator->info().id == id) {
+        stats.frame_generation_name = generator->info().name;
+        if (!generator->info().version.empty()) {
+          stats.frame_generation_name += " " + generator->info().version;
+        }
+        if (!generator->info().available && state.waiting.empty()) {
+          stats.frame_generation_waiting = generator->info().unavailable_reason;
+        }
+      }
+    }
+    if (stats.frame_generation_waiting.empty()) {
+      stats.frame_generation_waiting = state.waiting;
+    }
+  }
+  stats.render_width = state.render_width;
+  stats.render_height = state.render_height;
+  stats.output_width = paint_context_.swapchain_extent.width;
+  stats.output_height = paint_context_.swapchain_extent.height;
+  stats.hdr = paint_context_.swapchain_hdr;
+  stats.vsync = paint_context_.swapchain_is_fifo;
+  const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  if (temporal_upscale_.upscaler && temporal_upscale_.output_valid &&
+      now_us - temporal_upscale_.last_dispatch_us < 1000000) {
+    stats.upscaler = temporal_upscale_.upscaler->info().name;
+  }
+  return stats;
+}
+
+bool VulkanPresenter::CapturePresentedOutput(RawImage& image_out) {
+  if (!REXCVAR_GET(present_capture_readable)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(presented_capture_mutex_);
+  if (!presented_capture_written_) {
+    return false;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  {
+    const VulkanDevice::Queue::Acquisition queue_acquisition =
+        vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    if (dfn.vkQueueWaitIdle(queue_acquisition.queue()) != VK_SUCCESS) {
+      return false;
+    }
+  }
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, presented_capture_memory_, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  const VkExtent2D extent = presented_capture_extent_;
+  RawImage image;
+  image.width = extent.width;
+  image.height = extent.height;
+  image.stride = extent.width * 4;
+  image.data.resize(size_t(image.stride) * extent.height);
+  bool converted = true;
+  // scRGB (1.0 is 80 nits): the paper white back to SDR white, sRGB-encoded,
+  // highlights above it clipped.
+  auto half_to_float = [](uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+      if (mantissa == 0) {
+        bits = sign;
+      } else {
+        exponent = 113;
+        while (!(mantissa & 0x400u)) {
+          mantissa <<= 1;
+          --exponent;
+        }
+        bits = sign | (exponent << 23) | ((mantissa & 0x3FFu) << 13);
+      }
+    } else if (exponent == 31) {
+      bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  };
+  const float paper_white_inv =
+      float(80.0 / std::max(REXCVAR_GET(present_hdr_paper_white_nits), 1.0));
+  const uint32_t* source = static_cast<const uint32_t*>(mapping);
+  uint32_t* dest = reinterpret_cast<uint32_t*>(image.data.data());
+  const size_t pixel_count = size_t(extent.width) * extent.height;
+  switch (presented_capture_format_) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+      std::memcpy(dest, source, pixel_count * 4);
+      break;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const uint32_t bgra = source[i];
+        dest[i] = (bgra & 0xFF00FF00u) | ((bgra >> 16) & 0xFFu) | ((bgra & 0xFFu) << 16);
+      }
+      break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      for (size_t i = 0; i < pixel_count; ++i) {
+        dest[i] = Packed10bpcRGBTo8bpcBytes(source[i]);
+      }
+      break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: {
+      const uint16_t* halves = static_cast<const uint16_t*>(mapping);
+      for (size_t i = 0; i < pixel_count; ++i) {
+        uint32_t packed = 0xFF000000u;
+        for (uint32_t c = 0; c < 3; ++c) {
+          const float linear =
+              std::clamp(half_to_float(halves[i * 4 + c]) * paper_white_inv, 0.0f, 1.0f);
+          const float encoded = linear <= 0.0031308f
+                                    ? linear * 12.92f
+                                    : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
+          packed |= uint32_t(encoded * 255.0f + 0.5f) << (c * 8);
+        }
+        dest[i] = packed;
+      }
+      break;
+    }
+    default:
+      converted = false;
+      break;
+  }
+  dfn.vkUnmapMemory(device, presented_capture_memory_);
+  if (!converted) {
+    return false;
+  }
+  image_out = std::move(image);
+  return true;
+}
+
+Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+    const VulkanInstance::Extensions& instance_extensions) {
+  if (!instance_extensions.ext_KHR_surface) {
+    return 0;
+  }
+  Surface::TypeFlags type_flags = 0;
+#if REX_PLATFORM_ANDROID
+  if (instance_extensions.ext_KHR_android_surface) {
+    type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
+  }
+#endif
+#if REX_PLATFORM_GNU_LINUX
+  if (instance_extensions.ext_KHR_wayland_surface) {
+    type_flags |= Surface::kTypeFlag_WaylandSurface;
+  }
+  if (instance_extensions.ext_KHR_xcb_surface) {
+    type_flags |= Surface::kTypeFlag_XcbWindow;
+  }
+#endif
+#if REX_PLATFORM_WIN32
+  if (instance_extensions.ext_KHR_win32_surface) {
+    type_flags |= Surface::kTypeFlag_Win32Hwnd;
+  }
+#endif
+#if REX_PLATFORM_MAC
+  if (instance_extensions.ext_EXT_metal_surface) {
+    type_flags |= Surface::kTypeFlag_CAMetalLayer;
+  }
+#endif
+  return type_flags;
+}
+
+Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
+  if (!vulkan_device_->extensions().ext_KHR_swapchain) {
+    return 0;
+  }
+  return GetSurfaceTypesSupportedByInstance(vulkan_device_->vulkan_instance()->extensions());
+}
+
+bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
+  std::shared_ptr<GuestOutputImage> guest_output_image;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(
+        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
+      guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+    }
+    // Incremented the reference count of the guest output image - safe to leave
+    // the consumer critical section now.
+  }
+  if (!guest_output_image) {
+    return false;
+  }
+
+  VkExtent2D image_extent = guest_output_image->extent();
+  size_t pixel_count = size_t(image_extent.width) * image_extent.height;
+  VkDeviceSize buffer_size = VkDeviceSize(sizeof(uint32_t) * pixel_count);
+  VkBuffer buffer;
+  VkDeviceMemory buffer_memory;
+  if (!util::CreateDedicatedAllocationBuffer(
+          vulkan_device_, buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          util::MemoryPurpose::kReadback, buffer, buffer_memory)) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the guest output capture buffer");
+    return false;
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  {
+    VkCommandPoolCreateInfo command_pool_create_info;
+    command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    command_pool_create_info.pNext = nullptr;
+    command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    command_pool_create_info.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+    VkCommandPool command_pool;
+    if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr, &command_pool) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create the guest output capturing "
+          "command pool");
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer_memory, nullptr);
+      return false;
+    }
+
+    VkCommandBufferAllocateInfo command_buffer_allocate_info;
+    command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_buffer_allocate_info.pNext = nullptr;
+    command_buffer_allocate_info.commandPool = command_pool;
+    command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_buffer_allocate_info.commandBufferCount = 1;
+    VkCommandBuffer command_buffer;
+    if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info, &command_buffer) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to allocate the guest output capturing "
+          "command buffer");
+      dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer_memory, nullptr);
+      return false;
+    }
+
+    VkCommandBufferBeginInfo command_buffer_begin_info;
+    command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    command_buffer_begin_info.pNext = nullptr;
+    command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    command_buffer_begin_info.pInheritanceInfo = nullptr;
+    if (dfn.vkBeginCommandBuffer(command_buffer, &command_buffer_begin_info) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to begin recording the guest output "
+          "capturing command buffer");
+      dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer_memory, nullptr);
+      return false;
+    }
+
+    VkImageMemoryBarrier image_memory_barrier;
+    image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    image_memory_barrier.pNext = nullptr;
+    image_memory_barrier.srcAccessMask = kGuestOutputInternalAccessMask;
+    image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    image_memory_barrier.oldLayout = kGuestOutputInternalLayout;
+    image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_memory_barrier.image = guest_output_image->image();
+    image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
+    dfn.vkCmdPipelineBarrier(command_buffer, kGuestOutputInternalStageMask,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &image_memory_barrier);
+
+    VkBufferImageCopy buffer_image_copy = {};
+    buffer_image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    buffer_image_copy.imageSubresource.layerCount = 1;
+    buffer_image_copy.imageExtent.width = image_extent.width;
+    buffer_image_copy.imageExtent.height = image_extent.height;
+    buffer_image_copy.imageExtent.depth = 1;
+    dfn.vkCmdCopyImageToBuffer(command_buffer, guest_output_image->image(),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &buffer_image_copy);
+
+    // A fence doesn't guarantee host visibility and availability.
+    VkBufferMemoryBarrier buffer_memory_barrier;
+    buffer_memory_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    buffer_memory_barrier.pNext = nullptr;
+    buffer_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buffer_memory_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    buffer_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_memory_barrier.buffer = buffer;
+    buffer_memory_barrier.offset = 0;
+    buffer_memory_barrier.size = VK_WHOLE_SIZE;
+    std::swap(image_memory_barrier.srcAccessMask, image_memory_barrier.dstAccessMask);
+    std::swap(image_memory_barrier.oldLayout, image_memory_barrier.newLayout);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | kGuestOutputInternalStageMask, 0, 0,
+                             nullptr, 1, &buffer_memory_barrier, 1, &image_memory_barrier);
+
+    if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to end recording the guest output capturing "
+          "command buffer");
+      dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer_memory, nullptr);
+      return false;
+    }
+
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+    VulkanSubmissionTracker submission_tracker(vulkan_device_);
+    {
+      VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
+          submission_tracker.AcquireFenceToAdvanceSubmission());
+      if (!fence_acqusition.fence()) {
+        REXLOG_ERROR(
+            "VulkanPresenter: Failed to acquire a fence for guest output "
+            "capturing");
+        fence_acqusition.SubmissionFailedOrDropped();
+        dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+        dfn.vkDestroyBuffer(device, buffer, nullptr);
+        dfn.vkFreeMemory(device, buffer_memory, nullptr);
+        return false;
+      }
+      VkResult submit_result;
+      {
+        const VulkanDevice::Queue::Acquisition queue_acquisition =
+            vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+        submit_result =
+            dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+      }
+      if (submit_result != VK_SUCCESS) {
+        REXLOG_ERROR(
+            "VulkanPresenter: Failed to submit the guest output capturing "
+            "command buffer");
+        fence_acqusition.SubmissionFailedOrDropped();
+        dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+        dfn.vkDestroyBuffer(device, buffer, nullptr);
+        dfn.vkFreeMemory(device, buffer_memory, nullptr);
+        return false;
+      }
+    }
+    if (!submission_tracker.AwaitAllSubmissionsCompletion()) {
+      REXLOG_ERROR("VulkanPresenter: Failed to await the guest output capturing fence");
+      dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer_memory, nullptr);
+      return false;
+    }
+
+    dfn.vkDestroyCommandPool(device, command_pool, nullptr);
+  }
+
+  // Don't need the buffer anymore, just its memory.
+  dfn.vkDestroyBuffer(device, buffer, nullptr);
+
+  void* mapping;
+  if (dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to map the guest output capture memory");
+    dfn.vkFreeMemory(device, buffer_memory, nullptr);
+    return false;
+  }
+
+  image_out.width = image_extent.width;
+  image_out.height = image_extent.height;
+  image_out.stride = sizeof(uint32_t) * image_extent.width;
+  image_out.data.resize(size_t(buffer_size));
+  uint32_t* image_out_pixels = reinterpret_cast<uint32_t*>(image_out.data.data());
+  for (size_t i = 0; i < pixel_count; ++i) {
+    image_out_pixels[i] = Packed10bpcRGBTo8bpcBytes(reinterpret_cast<const uint32_t*>(mapping)[i]);
+  }
+
+  // Unmapping will be done by freeing.
+  dfn.vkFreeMemory(device, buffer_memory, nullptr);
+
+  return true;
+}
+
+VkCommandBuffer VulkanPresenter::AcquireUISetupCommandBufferFromUIThread() {
+  if (paint_context_.ui_setup_command_buffer_current_index != SIZE_MAX) {
+    return paint_context_
+        .ui_setup_command_buffers[paint_context_.ui_setup_command_buffer_current_index]
+        .command_buffer;
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkCommandBufferBeginInfo command_buffer_begin_info;
+  command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  command_buffer_begin_info.pNext = nullptr;
+  command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  command_buffer_begin_info.pInheritanceInfo = nullptr;
+
+  // Try to reuse an existing command buffer.
+  if (!paint_context_.ui_setup_command_buffers.empty()) {
+    uint64_t submission_index_completed = ui_submission_tracker_.UpdateAndGetCompletedSubmission();
+    for (size_t i = 0; i < paint_context_.ui_setup_command_buffers.size(); ++i) {
+      PaintContext::UISetupCommandBuffer& ui_setup_command_buffer =
+          paint_context_.ui_setup_command_buffers[i];
+      if (ui_setup_command_buffer.last_usage_submission_index > submission_index_completed) {
+        continue;
+      }
+      if (dfn.vkResetCommandPool(device, ui_setup_command_buffer.command_pool, 0) != VK_SUCCESS) {
+        REXLOG_ERROR("VulkanPresenter: Failed to reset a UI setup command pool");
+        return VK_NULL_HANDLE;
+      }
+      if (dfn.vkBeginCommandBuffer(ui_setup_command_buffer.command_buffer,
+                                   &command_buffer_begin_info) != VK_SUCCESS) {
+        REXLOG_ERROR(
+            "VulkanPresenter: Failed to begin UI setup command buffer "
+            "recording");
+        return VK_NULL_HANDLE;
+      }
+      paint_context_.ui_setup_command_buffer_current_index = i;
+      ui_setup_command_buffer.last_usage_submission_index =
+          ui_submission_tracker_.GetCurrentSubmission();
+      return ui_setup_command_buffer.command_buffer;
+    }
+  }
+
+  // Create a new command buffer.
+  VkCommandPoolCreateInfo command_pool_create_info;
+  command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  command_pool_create_info.pNext = nullptr;
+  command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  command_pool_create_info.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+  VkCommandPool new_command_pool;
+  if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr, &new_command_pool) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create a UI setup command pool");
+    return VK_NULL_HANDLE;
+  }
+  VkCommandBufferAllocateInfo command_buffer_allocate_info;
+  command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  command_buffer_allocate_info.pNext = nullptr;
+  command_buffer_allocate_info.commandPool = new_command_pool;
+  command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_buffer_allocate_info.commandBufferCount = 1;
+  VkCommandBuffer new_command_buffer;
+  if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info, &new_command_buffer) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to allocate a UI setup command buffer");
+    dfn.vkDestroyCommandPool(device, new_command_pool, nullptr);
+    return VK_NULL_HANDLE;
+  }
+  if (dfn.vkBeginCommandBuffer(new_command_buffer, &command_buffer_begin_info) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to begin UI setup command buffer recording");
+    dfn.vkDestroyCommandPool(device, new_command_pool, nullptr);
+    return VK_NULL_HANDLE;
+  }
+  paint_context_.ui_setup_command_buffer_current_index =
+      paint_context_.ui_setup_command_buffers.size();
+  paint_context_.ui_setup_command_buffers.emplace_back(
+      new_command_pool, new_command_buffer, ui_submission_tracker_.GetCurrentSubmission());
+  return new_command_buffer;
+}
+
+Presenter::SurfacePaintConnectResult
+VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_surface,
+                                                                 uint32_t new_surface_width,
+                                                                 uint32_t new_surface_height,
+                                                                 bool was_paintable,
+                                                                 bool& is_vsync_implicit_out) {
+  const VulkanInstance* const vulkan_instance = vulkan_device_->vulkan_instance();
+  const VulkanInstance::Functions& ifn = vulkan_instance->functions();
+  const VkInstance instance = vulkan_instance->instance();
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkFormat new_swapchain_format;
+
+  // ConnectOrReconnectToSurfaceFromUIThread may be called only for the
+  // ui::Surface of the current swapchain or when the old swapchain and
+  // VkSurface have, if the ui::Surface is the same, try using the existing
+  // VkSurface and creating the swapchain smoothly from the existing one - if
+  // this doesn't succeed, start from scratch.
+  // The retirement or destruction of the swapchain here will also cause
+  // awaiting completion of the usage of the swapchain and the surface on the
+  // GPU.
+#if REX_PLATFORM_MAC
+  // On MoltenVK a swapchain created from the old one on the same CAMetalLayer
+  // presents, but the window shows one flat colour (black, or a colour from
+  // the frame) after every resize, menus included. A new VkSurface for the
+  // layer presents normally, so start from scratch on each reconnection.
+  if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+    paint_context_.DestroySwapchainAndVulkanSurface();
+  }
+#endif
+  if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+    VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+    bool surface_unusable;
+    paint_context_.swapchain_last_present_id = 0;
+    paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+        vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+        old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_hdr, surface_unusable,
+        paint_context_.swapchain_frame_generation);
+    paint_context_.swapchain_frame_generation_requested =
+        REXCVAR_GET(present_frame_generation) != "off";
+    // Destroy the old swapchain that may be retired now.
+    if (old_swapchain != VK_NULL_HANDLE) {
+      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
+    }
+    if (paint_context_.swapchain == VK_NULL_HANDLE) {
+      // Couldn't create the swapchain for the existing surface - start over.
+      paint_context_.DestroySwapchainAndVulkanSurface();
+    }
+  }
+
+  // If failed to create the swapchain for the previous surface, recreate the
+  // surface and create the new swapchain.
+  if (paint_context_.swapchain == VK_NULL_HANDLE) {
+    // DestroySwapchainAndVulkanSurface should have been called previously.
+    assert_true(paint_context_.vulkan_surface == VK_NULL_HANDLE);
+    Surface::TypeIndex surface_type = new_surface.GetType();
+    // Check if the surface type is supported according to the Vulkan
+    // extensions.
+    if (!(GetSupportedSurfaceTypes() & (Surface::TypeFlags(1) << surface_type))) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Tried to create a Vulkan surface for an "
+          "unsupported Xenia surface type");
+      return SurfacePaintConnectResult::kFailureSurfaceUnusable;
+    }
+    VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
+    switch (surface_type) {
+#if REX_PLATFORM_ANDROID
+      case Surface::kTypeIndex_AndroidNativeWindow: {
+        auto& android_native_window_surface =
+            static_cast<const AndroidNativeWindowSurface&>(new_surface);
+        VkAndroidSurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.window = android_native_window_surface.window();
+        vulkan_surface_create_result = ifn.vkCreateAndroidSurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        paint_context_.android_window = android_native_window_surface.window();
+      } break;
+#endif
+#if REX_PLATFORM_GNU_LINUX
+      case Surface::kTypeIndex_XcbWindow: {
+        auto& xcb_window_surface = static_cast<const XcbWindowSurface&>(new_surface);
+        VkXcbSurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.connection = xcb_window_surface.connection();
+        surface_create_info.window = xcb_window_surface.window();
+        vulkan_surface_create_result = ifn.vkCreateXcbSurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+      case Surface::kTypeIndex_WaylandSurface: {
+        auto& wayland_surface = static_cast<const WaylandSurface&>(new_surface);
+        VkWaylandSurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.display = wayland_surface.display();
+        surface_create_info.surface = wayland_surface.surface();
+        vulkan_surface_create_result = ifn.vkCreateWaylandSurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_WIN32
+      case Surface::kTypeIndex_Win32Hwnd: {
+        auto& win32_hwnd_surface = static_cast<const Win32HwndSurface&>(new_surface);
+        VkWin32SurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.hinstance = win32_hwnd_surface.hinstance();
+        surface_create_info.hwnd = win32_hwnd_surface.hwnd();
+        vulkan_surface_create_result = ifn.vkCreateWin32SurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_MAC
+      case Surface::kTypeIndex_CAMetalLayer: {
+        auto& metal_surface = static_cast<const CAMetalLayerSurface&>(new_surface);
+        VkMetalSurfaceCreateInfoEXT surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.pLayer = metal_surface.layer();
+        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        paint_context_.mac_metal_layer = metal_surface.layer();
+      } break;
+#endif
+      default:
+        assert_unhandled_case(surface_type);
+        REXLOG_ERROR(
+            "VulkanPresenter: Tried to create a Vulkan surface for an "
+            "unknown Xenia surface type");
+        return SurfacePaintConnectResult::kFailureSurfaceUnusable;
+    }
+    if (vulkan_surface_create_result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan surface");
+      return SurfacePaintConnectResult::kFailure;
+    }
+    bool surface_unusable;
+    paint_context_.swapchain_last_present_id = 0;
+    paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+        vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+        VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_hdr, surface_unusable,
+        paint_context_.swapchain_frame_generation);
+    paint_context_.swapchain_frame_generation_requested =
+        REXCVAR_GET(present_frame_generation) != "off";
+    if (paint_context_.swapchain == VK_NULL_HANDLE) {
+      // Failed to create the swapchain for the new Vulkan surface - destroy the
+      // Vulkan surface.
+      ifn.vkDestroySurfaceKHR(instance, paint_context_.vulkan_surface, nullptr);
+      paint_context_.vulkan_surface = VK_NULL_HANDLE;
+      return surface_unusable ? SurfacePaintConnectResult::kFailureSurfaceUnusable
+                              : SurfacePaintConnectResult::kFailure;
+    }
+    // Successfully attached (at least for now).
+  }
+
+  // From now on, in case of failure,
+  // paint_context_.DestroySwapchainAndVulkanSurface must be called before
+  // returning.
+
+  if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed) &&
+      vulkan_device_->extensions().ext_EXT_hdr_metadata) {
+    // Mastered for the display itself, so that it shows the levels as they
+    // are, clipping at its own peak, rather than tone-mapping them from an
+    // assumed 1000-10000 nit master (which flattened the whole image on the
+    // Odin 2 Portal and kept the peak calibration square visible).
+    float max_nits = float(REXCVAR_GET(present_hdr_peak_nits));
+    float max_average_nits = max_nits;
+    float min_nits = 0.0f;
+#if REX_PLATFORM_ANDROID
+    if (GetAndroidDisplayHdr().max_nits > 0.0f) {
+      max_nits = GetAndroidDisplayHdr().max_nits;
+      max_average_nits = GetAndroidDisplayHdr().max_average_nits > 0.0f
+                             ? GetAndroidDisplayHdr().max_average_nits
+                             : max_nits;
+      min_nits = GetAndroidDisplayHdr().min_nits;
+    }
+#endif
+    VkHdrMetadataEXT metadata = {};
+    metadata.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+    // BT.2020 primaries, D65 white.
+    metadata.displayPrimaryRed = {0.708f, 0.292f};
+    metadata.displayPrimaryGreen = {0.170f, 0.797f};
+    metadata.displayPrimaryBlue = {0.131f, 0.046f};
+    metadata.whitePoint = {0.3127f, 0.3290f};
+    metadata.maxLuminance = max_nits;
+    metadata.minLuminance = min_nits;
+    metadata.maxContentLightLevel = max_nits;
+    metadata.maxFrameAverageLightLevel = max_average_nits;
+    vulkan_device_->functions().vkSetHdrMetadataEXT(device, 1, &paint_context_.swapchain,
+                                                    &metadata);
+    REXLOG_INFO("VulkanPresenter: HDR10 metadata: peak {} nits, frame average {} nits, black {} nits",
+                max_nits, max_average_nits, min_nits);
+  } else if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed)) {
+    REXLOG_WARN("VulkanPresenter: HDR10 without metadata (no VK_EXT_hdr_metadata)");
+  }
+#if REX_PLATFORM_ANDROID
+  if (paint_context_.swapchain_hdr && hdr_output_pq_dataspace.load(std::memory_order_relaxed) &&
+      paint_context_.android_window) {
+    // After the swapchain set its own data space from the color space.
+    const int32_t result = ANativeWindow_setBuffersDataSpace(
+        static_cast<ANativeWindow*>(paint_context_.android_window), ADATASPACE_BT2020_PQ);
+    if (result != 0) {
+      REXLOG_WARN("VulkanPresenter: Failed to mark the window HDR10 ({})", result);
+    }
+  }
+#endif
+  // Update the render pass to the new format. With an HDR swapchain, it draws
+  // into the SDR stand-ins, and the last pass samples them.
+  const bool hdr = paint_context_.swapchain_hdr;
+  const VkFormat render_pass_format = hdr ? PaintContext::kHdrStandInFormat : new_swapchain_format;
+  paint_context_.swapchain_image_format = new_swapchain_format;
+  if (paint_context_.swapchain_render_pass_format != render_pass_format ||
+      paint_context_.swapchain_render_pass_hdr != hdr) {
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                               paint_context_.swapchain_render_pass);
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                               paint_context_.swapchain_load_render_pass);
+    paint_context_.swapchain_render_pass_format = render_pass_format;
+  }
+  if (paint_context_.swapchain_render_pass == VK_NULL_HANDLE) {
+    VkAttachmentDescription render_pass_attachment;
+    render_pass_attachment.flags = 0;
+    render_pass_attachment.format = render_pass_format;
+    render_pass_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    render_pass_attachment.loadOp = REXCVAR_GET(present_render_pass_clear)
+                                        ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                        : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    render_pass_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    render_pass_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    render_pass_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    render_pass_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    render_pass_attachment.finalLayout =
+        hdr ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference render_pass_color_attachment;
+    render_pass_color_attachment.attachment = 0;
+    render_pass_color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription render_pass_subpass = {};
+    render_pass_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    render_pass_subpass.colorAttachmentCount = 1;
+    render_pass_subpass.pColorAttachments = &render_pass_color_attachment;
+    VkSubpassDependency render_pass_dependencies[2];
+    render_pass_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    render_pass_dependencies[0].dstSubpass = 0;
+    // srcStageMask is the semaphore wait stage.
+    render_pass_dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    render_pass_dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    render_pass_dependencies[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    // The main target can be used for UI drawing at any moment, which requires
+    // blending, so VK_ACCESS_COLOR_ATTACHMENT_READ_BIT is also included.
+    render_pass_dependencies[0].dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    render_pass_dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    render_pass_dependencies[1].srcSubpass = 0;
+    render_pass_dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    render_pass_dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // Semaphores are signaled at VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT.
+    render_pass_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    render_pass_dependencies[1].srcAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    render_pass_dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    render_pass_dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    if (hdr) {
+      // The stand-in was last sampled by an earlier frame's HDR pass, and is
+      // sampled next by this frame's.
+      render_pass_dependencies[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      render_pass_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      render_pass_dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      render_pass_dependencies[1].dependencyFlags = 0;
+    }
+    VkRenderPassCreateInfo render_pass_create_info;
+    render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    render_pass_create_info.pNext = nullptr;
+    render_pass_create_info.flags = 0;
+    render_pass_create_info.attachmentCount = 1;
+    render_pass_create_info.pAttachments = &render_pass_attachment;
+    render_pass_create_info.subpassCount = 1;
+    render_pass_create_info.pSubpasses = &render_pass_subpass;
+    render_pass_create_info.dependencyCount = uint32_t(rex::countof(render_pass_dependencies));
+    render_pass_create_info.pDependencies = render_pass_dependencies;
+    VkRenderPass new_render_pass;
+    if (dfn.vkCreateRenderPass(device, &render_pass_create_info, nullptr, &new_render_pass) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create the render pass for drawing to "
+          "swapchain images");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_render_pass = new_render_pass;
+    paint_context_.swapchain_render_pass_format = render_pass_format;
+    // Before the loading pass below reuses the description: a clearing pass
+    // must begin with its clear value. Without one, beginning it read a null
+    // pClearValues, which crashed the system Adreno and Mali drivers on the
+    // first paint (pinyon-shift #1101, #1107).
+    paint_context_.swapchain_render_pass_clear_load_op =
+        render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // UP-4: the same pass over an image already painted and copied from:
+    // compatible with it, so its framebuffers and pipelines serve both.
+    render_pass_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    render_pass_attachment.initialLayout = render_pass_attachment.finalLayout;
+    render_pass_dependencies[0].srcStageMask |=
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    render_pass_dependencies[0].srcAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
+    render_pass_dependencies[0].dependencyFlags = 0;
+    VkRenderPass load_render_pass;
+    if (dfn.vkCreateRenderPass(device, &render_pass_create_info, nullptr, &load_render_pass) ==
+        VK_SUCCESS) {
+      paint_context_.swapchain_load_render_pass = load_render_pass;
+    } else {
+      REXLOG_WARN("VulkanPresenter: no loading swapchain render pass; frame generation shows "
+                  "the HUD and UI in generated frames");
+    }
+    paint_context_.swapchain_render_pass_hdr = hdr;
+  }
+
+  // Get the swapchain images.
+  paint_context_.swapchain_images.clear();
+  VkResult swapchain_images_get_result;
+  for (;;) {
+    uint32_t swapchain_image_count = uint32_t(paint_context_.swapchain_images.size());
+    bool swapchain_images_were_empty = !swapchain_image_count;
+    swapchain_images_get_result = dfn.vkGetSwapchainImagesKHR(
+        device, paint_context_.swapchain, &swapchain_image_count,
+        swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
+    // If the original swapchain image count was 0 (first call), SUCCESS is
+    // returned, not INCOMPLETE.
+    if (swapchain_images_get_result == VK_SUCCESS || swapchain_images_get_result == VK_INCOMPLETE) {
+      paint_context_.swapchain_images.resize(swapchain_image_count);
+      if (swapchain_images_get_result == VK_SUCCESS &&
+          (!swapchain_images_were_empty || !swapchain_image_count)) {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  if (swapchain_images_get_result != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to get swapchain images");
+    paint_context_.DestroySwapchainAndVulkanSurface();
+    return SurfacePaintConnectResult::kFailure;
+  }
+
+  if (hdr && !CreateHdrSwapchainImages(new_swapchain_format)) {
+    paint_context_.DestroySwapchainAndVulkanSurface();
+    return SurfacePaintConnectResult::kFailure;
+  }
+
+  // Create the image views and the framebuffers.
+  assert_true(paint_context_.swapchain_framebuffers.empty());
+  paint_context_.swapchain_framebuffers.reserve(paint_context_.swapchain_images.size());
+  VkImageViewCreateInfo image_view_create_info;
+  image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  image_view_create_info.pNext = nullptr;
+  image_view_create_info.flags = 0;
+  image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  image_view_create_info.format = render_pass_format;
+  image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  image_view_create_info.subresourceRange.baseMipLevel = 0;
+  image_view_create_info.subresourceRange.levelCount = 1;
+  image_view_create_info.subresourceRange.baseArrayLayer = 0;
+  image_view_create_info.subresourceRange.layerCount = 1;
+  VkImageView image_view;
+  VkFramebufferCreateInfo framebuffer_create_info;
+  framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+  framebuffer_create_info.pNext = nullptr;
+  framebuffer_create_info.flags = 0;
+  framebuffer_create_info.renderPass = paint_context_.swapchain_render_pass;
+  framebuffer_create_info.attachmentCount = 1;
+  framebuffer_create_info.pAttachments = &image_view;
+  framebuffer_create_info.width = paint_context_.swapchain_extent.width;
+  framebuffer_create_info.height = paint_context_.swapchain_extent.height;
+  framebuffer_create_info.layers = 1;
+  for (size_t image_index = 0; image_index < paint_context_.swapchain_images.size();
+       ++image_index) {
+    image_view_create_info.image = hdr ? paint_context_.hdr_images[image_index].image
+                                       : paint_context_.swapchain_images[image_index];
+    if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &image_view) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain image view");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    VkFramebuffer framebuffer;
+    if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr, &framebuffer) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain framebuffer");
+      dfn.vkDestroyImageView(device, image_view, nullptr);
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    VkSemaphoreCreateInfo present_semaphore_create_info = {};
+    present_semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkSemaphore present_semaphore;
+    if (dfn.vkCreateSemaphore(device, &present_semaphore_create_info, nullptr,
+                              &present_semaphore) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create a swapchain image presentation "
+          "semaphore");
+      dfn.vkDestroyFramebuffer(device, framebuffer, nullptr);
+      dfn.vkDestroyImageView(device, image_view, nullptr);
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer,
+                                                       present_semaphore);
+  }
+
+  is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
+  return SurfacePaintConnectResult::kSuccess;
+}
+
+void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
+  paint_context_.DestroySwapchainAndVulkanSurface();
+}
+
+bool VulkanPresenter::RefreshGuestOutputImpl(
+    uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+    std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
+  assert_not_zero(frontbuffer_width);
+  assert_not_zero(frontbuffer_height);
+  VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device_->properties());
+  if (frontbuffer_width > max_framebuffer_extent.width ||
+      frontbuffer_height > max_framebuffer_extent.height) {
+    // Writing the guest output isn't supposed to rescale, and a guest texture
+    // exceeding the maximum size won't be loadable anyway.
+    return false;
+  }
+
+  GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
+  if (image_instance.image && (image_instance.image->extent().width != frontbuffer_width ||
+                               image_instance.image->extent().height != frontbuffer_height)) {
+    guest_output_image_refresher_submission_tracker_.AwaitSubmissionCompletion(
+        image_instance.last_refresher_submission);
+    image_instance.image.reset();
+  }
+  if (!image_instance.image) {
+    std::unique_ptr<GuestOutputImage> new_image =
+        GuestOutputImage::Create(vulkan_device_, frontbuffer_width, frontbuffer_height);
+    if (!new_image) {
+      return false;
+    }
+    image_instance.SetToNewImage(std::move(new_image), guest_output_image_next_version_++);
+  }
+
+  bool hudless_written = false;
+  bool camera_written = false;
+  UpscalerCamera camera;
+  VulkanGuestOutputRefreshContext context(
+      is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
+      image_instance.version, image_instance.ever_successfully_refreshed,
+      image_instance.image.get(), &hudless_written, &camera, &camera_written);
+  bool refresher_succeeded = refresher(context);
+  if (refresher_succeeded) {
+    image_instance.ever_successfully_refreshed = true;
+  }
+  image_instance.hudless_valid = refresher_succeeded && hudless_written;
+  image_instance.camera_valid = refresher_succeeded && camera_written;
+  image_instance.camera = camera;
+  // Deferred: the refresher's work reaches the queue later, and the step
+  // signals after it.
+  if (!IsGuestOutputPublishDeferred()) {
+    GuestOutputRefreshSubmitted(mailbox_index);
+  }
+  return refresher_succeeded;
+}
+
+void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
+  GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
+  image_instance.refresh_serial = ++guest_output_refresh_serial_;
+  // Even if the refresher has returned false, it still might have submitted
+  // some commands referencing the image. It's better to put an excessive
+  // signal and wait slightly longer, for nothing important, while shutting down
+  // than to destroy the image while it's still in use.
+  image_instance.last_refresher_submission =
+      guest_output_image_refresher_submission_tracker_.GetCurrentSubmission();
+  // No need to make the refresher signal the fence by itself - signal it here
+  // instead to have more control:
+  // "Fence signal operations that are defined by vkQueueSubmit additionally
+  //  include in the first synchronization scope all commands that occur earlier
+  //  in submission order."
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  {
+    VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
+        guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
+    const VulkanDevice::Queue::Acquisition queue_acquisition =
+        vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
+        VK_SUCCESS) {
+      fence_acqusition.SubmissionSucceededSignalFailed();
+    }
+  }
+}
+
+namespace {
+std::atomic<bool> hdr_output_offered = false;
+std::atomic<bool> hdr_output_active = false;
+}  // namespace
+
+HdrOutputState GetHdrOutputState() {
+  return {hdr_output_offered.load(std::memory_order_relaxed),
+          hdr_output_active.load(std::memory_order_relaxed)};
+}
+
+VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+    const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
+    VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out,
+    bool& ui_surface_unusable_out, bool& frame_generation_out) {
+  ui_surface_unusable_out = false;
+  hdr_out = false;
+  frame_generation_out = false;
+
+  const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
+  const VkPhysicalDevice physical_device = vulkan_device->physical_device();
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Get surface capabilities.
+  VkSurfaceCapabilitiesKHR surface_capabilities;
+  if (ifn.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                    &surface_capabilities) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to get Vulkan surface capabilities");
+    // Some strange error, try again later.
+    return VK_NULL_HANDLE;
+  }
+
+  // First, check if the surface is not zero-area because in this case, the rest
+  // of the fields in theory may not be informative as the surface doesn't need
+  // to go to presentation anyway, thus there's no need to return real
+  // information, and ui_surface_unusable_out (from which it may not be possible
+  // to recover on certain platforms at all) may be set to true spuriously if
+  // any checks set it to true. VkSurfaceKHR may have zero-area bounds in some
+  // window state cases on Windows, for example. Also clamp the requested size
+  // to the maximum supported by the physical device as long as minImageExtent
+  // in the instance's WSI allows that (if not, there's no way to satisfy both
+  // requirements - the maximum 2D framebuffer size on the specific physical
+  // device, and the minimum swap chain size on the whole instance - fail to
+  // create until the surface becomes smaller).
+#if REX_PLATFORM_ANDROID
+  // Android's swapchain scales its images to the window, so a smaller one
+  // costs no composition: on a Mali-G720 at 2960x1848, half the size saved
+  // 0.4-2 ms of GPU time a frame (MALI_BACKLOG MT-1.9 in Pinyon Shift).
+  {
+    uint32_t divisor = uint32_t(std::max(REXCVAR_GET(android_present_divisor), int32_t(0)));
+    if (!divisor) {
+      auto scale = [](const char* name) {
+        const std::string value = rex::cvar::GetFlagByName(name);
+        const uint32_t parsed = uint32_t(std::strtoul(value.c_str(), nullptr, 10));
+        return std::max(parsed, uint32_t(1));
+      };
+      const uint32_t output_long = 1280 * scale("draw_resolution_scale_x");
+      const uint32_t output_short = 720 * scale("draw_resolution_scale_y");
+      const uint32_t surface_long = std::max(width, height);
+      const uint32_t surface_short = std::min(width, height);
+      divisor = 1;
+      while (surface_long / (divisor + 1) >= output_long &&
+             surface_short / (divisor + 1) >= output_short) {
+        ++divisor;
+      }
+    }
+    if (divisor > 1) {
+      width = std::max(width / divisor, uint32_t(1));
+      height = std::max(height / divisor, uint32_t(1));
+    }
+  }
+#endif
+  VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device->properties());
+  VkExtent2D image_extent;
+  image_extent.width = std::min(std::max(std::min(width, max_framebuffer_extent.width),
+                                         surface_capabilities.minImageExtent.width),
+                                surface_capabilities.maxImageExtent.width);
+  image_extent.height = std::min(std::max(std::min(height, max_framebuffer_extent.height),
+                                          surface_capabilities.minImageExtent.height),
+                                 surface_capabilities.maxImageExtent.height);
+  if (!image_extent.width || !image_extent.height ||
+      image_extent.width > max_framebuffer_extent.width ||
+      image_extent.height > max_framebuffer_extent.height) {
+    return VK_NULL_HANDLE;
+  }
+
+  // Get the queue family for presentation.
+  uint32_t queue_family_index_present = UINT32_MAX;
+  const std::vector<VulkanDevice::QueueFamily>& queue_families = vulkan_device->queue_families();
+  VkBool32 queue_family_present_supported;
+  // First try the graphics and compute queue, prefer it to avoid the concurrent
+  // image sharing mode.
+  uint32_t queue_family_index_graphics_compute = vulkan_device->queue_family_graphics_compute();
+  const VulkanDevice::QueueFamily& queue_family_graphics_compute =
+      queue_families[queue_family_index_graphics_compute];
+  if (queue_family_graphics_compute.may_support_presentation &&
+      !queue_family_graphics_compute.queues.empty() &&
+      ifn.vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, queue_family_index_graphics_compute,
+                                               surface,
+                                               &queue_family_present_supported) == VK_SUCCESS &&
+      queue_family_present_supported) {
+    queue_family_index_present = queue_family_index_graphics_compute;
+  } else {
+    for (uint32_t i = 0; i < uint32_t(queue_families.size()); ++i) {
+      const VulkanDevice::QueueFamily& queue_family = queue_families[i];
+      if (!queue_family.queues.empty() && queue_family.may_support_presentation &&
+          ifn.vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface,
+                                                   &queue_family_present_supported) == VK_SUCCESS &&
+          queue_family_present_supported) {
+        queue_family_index_present = i;
+        break;
+      }
+    }
+  }
+  if (queue_family_index_present == UINT32_MAX) {
+    // Not unusable though - may become presentable if the window (with the same
+    // surface) moved to a different display, for instance.
+    return VK_NULL_HANDLE;
+  }
+
+  // TODO(Triang3l): Support transforms.
+  if (!(surface_capabilities.supportedTransforms &
+        (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR))) {
+    REXLOG_ERROR(
+        "VulkanPresenter: The surface doesn't support identity or "
+        "window-system-controlled transform");
+    return VK_NULL_HANDLE;
+  }
+
+  // Get the surface format.
+  std::vector<VkSurfaceFormatKHR> surface_formats;
+  VkResult surface_formats_get_result;
+  for (;;) {
+    uint32_t surface_format_count = uint32_t(surface_formats.size());
+    bool surface_formats_were_empty = !surface_format_count;
+    surface_formats_get_result = ifn.vkGetPhysicalDeviceSurfaceFormatsKHR(
+        physical_device, surface, &surface_format_count,
+        surface_formats_were_empty ? nullptr : surface_formats.data());
+    // If the original presentation mode count was 0 (first call), SUCCESS is
+    // returned, not INCOMPLETE.
+    if (surface_formats_get_result == VK_SUCCESS || surface_formats_get_result == VK_INCOMPLETE) {
+      surface_formats.resize(surface_format_count);
+      if (surface_formats_get_result == VK_SUCCESS &&
+          (!surface_formats_were_empty || !surface_format_count)) {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  if (surface_formats_get_result != VK_SUCCESS) {
+    // Assuming any format in case of an error (or as some fallback in case of
+    // specification violation).
+    surface_formats.clear();
+  }
+#if REX_PLATFORM_ANDROID
+  // Android uses R8G8B8A8.
+  static const VkFormat kFormat8888Primary = VK_FORMAT_R8G8B8A8_UNORM;
+  static const VkFormat kFormat8888Secondary = VK_FORMAT_B8G8R8A8_UNORM;
+#else
+  // GNU/Linux X11 and Windows DWM use B8G8R8A8.
+  static const VkFormat kFormat8888Primary = VK_FORMAT_B8G8R8A8_UNORM;
+  static const VkFormat kFormat8888Secondary = VK_FORMAT_R8G8B8A8_UNORM;
+#endif
+  VkSurfaceFormatKHR image_format;
+  if (surface_formats.empty() ||
+      (surface_formats.size() == 1 || surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
+    // Can choose any format if the implementation specifies only UNDEFINED.
+    image_format.format = kFormat8888Primary;
+    image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+  } else {
+    // Pick the sRGB 8888 format preferred by the OS, fall back to any sRGB
+    // 8888, then to 8888 with an unknown color space, and then to the first
+    // sRGB available, and then to the first.
+    auto format_8888_primary_it = surface_formats.cend();
+    auto format_8888_secondary_it = surface_formats.cend();
+    auto any_non_8888_srgb_it = surface_formats.cend();
+    for (auto it = surface_formats.cbegin(); it != surface_formats.cend(); ++it) {
+      if (it->format != kFormat8888Primary && it->format != kFormat8888Secondary) {
+        if (it->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+            any_non_8888_srgb_it == surface_formats.cend()) {
+          any_non_8888_srgb_it = it;
+        }
+        continue;
+      }
+      auto& preferred_8888_it =
+          it->format == kFormat8888Primary ? format_8888_primary_it : format_8888_secondary_it;
+      if (preferred_8888_it == surface_formats.cend()) {
+        // First primary or secondary 8888 encounter.
+        preferred_8888_it = it;
+        continue;
+      }
+      // Is this a better primary or secondary 8888, that is, this is sRGB,
+      // while the previous encounter was not?
+      if (it->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+          preferred_8888_it->colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        preferred_8888_it = it;
+      }
+    }
+    if (format_8888_primary_it != surface_formats.cend() &&
+        format_8888_secondary_it != surface_formats.cend()) {
+      // Both the primary and the secondary 8888 formats are available - prefer
+      // sRGB, if both are sRGB or not, prefer the primary format.
+      if (format_8888_primary_it->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ||
+          format_8888_secondary_it->colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        image_format = *format_8888_primary_it;
+      } else {
+        image_format = *format_8888_secondary_it;
+      }
+    } else if (format_8888_primary_it != surface_formats.cend()) {
+      // Only primary 8888.
+      image_format = *format_8888_primary_it;
+    } else if (format_8888_secondary_it != surface_formats.cend()) {
+      // Only secondary 8888.
+      image_format = *format_8888_secondary_it;
+    } else if (any_non_8888_srgb_it != surface_formats.cend()) {
+      // No 8888, but some sRGB format is available.
+      image_format = *any_non_8888_srgb_it;
+    } else {
+      // Just pick any format.
+      image_format = surface_formats.front();
+    }
+  }
+  // Where asked and offered, an HDR swapchain. The SDR image is painted into
+  // a stand-in and converted by the last pass.
+  // - Windows: scRGB, linear BT.709 with 1.0 at 80 nits, which it composes as
+  //   is.
+  // - Android: HDR10 (BT.2020 PQ, absolute nits). Android takes scRGB 1.0 as
+  //   SDR white and, without a requested headroom (and before Android 14 at
+  //   all), clips there: the paper white pushed the whole image into that
+  //   clip (#500). A PQ layer puts the display in its HDR mode instead.
+  {
+    static std::atomic<bool> logged_formats = false;
+    if (!logged_formats.exchange(true)) {
+      std::string formats;
+      for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+        formats += fmt::format(" {}/{}", uint32_t(surface_format.format),
+                               uint32_t(surface_format.colorSpace));
+      }
+      REXLOG_INFO("VulkanPresenter: surface formats (format/color space):{}", formats);
+    }
+  }
+  bool hdr_offered = false;
+  bool hdr_pq = false;
+  bool hdr_pq_dataspace = false;
+#if REX_PLATFORM_ANDROID
+  // Log the display even when Vulkan offers HDR10 directly or lacks metadata.
+  const AndroidDisplayHdr& display_hdr = GetAndroidDisplayHdr();
+#endif
+  if (vulkan_device->vulkan_instance()->extensions().ext_EXT_swapchain_colorspace) {
+    const VkSurfaceFormatKHR* hdr_format = nullptr;
+    for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+#if REX_PLATFORM_ANDROID
+      // The float format first: it keeps the stand-in's precision.
+      if (surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+          (surface_format.format == kHdrFormat ||
+           (surface_format.format == kHdrPqFormat && !hdr_format))) {
+        hdr_format = &surface_format;
+        hdr_pq = true;
+      }
+#else
+      if (surface_format.format == kHdrFormat &&
+          surface_format.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+        hdr_format = &surface_format;
+        break;
+      }
+#endif
+    }
+#if REX_PLATFORM_ANDROID
+    // Android 13 lists no HDR10 color space even for an HDR10 display; the
+    // window still composes BT.2020 PQ buffers, as video players use.
+    if (!hdr_format && display_hdr.hdr10) {
+      for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+        if (surface_format.format == kHdrPqFormat &&
+            surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+          hdr_format = &surface_format;
+          hdr_pq = true;
+          hdr_pq_dataspace = true;
+          break;
+        }
+      }
+    }
+#endif
+    if (hdr_format) {
+      hdr_offered = true;
+      if (REXCVAR_GET(present_hdr)) {
+        image_format = *hdr_format;
+        hdr_out = true;
+      }
+    }
+  }
+  hdr_output_offered.store(hdr_offered, std::memory_order_relaxed);
+  hdr_output_active.store(hdr_out, std::memory_order_relaxed);
+  hdr_output_pq.store(hdr_out && hdr_pq, std::memory_order_relaxed);
+  hdr_output_pq_dataspace.store(hdr_out && hdr_pq_dataspace, std::memory_order_relaxed);
+  {
+    // 0 not logged, 1 SDR, 2 not offered, 3 scRGB, 4 and 5 HDR10.
+    static std::atomic<int> logged_hdr_choice = 0;
+    const int choice = !REXCVAR_GET(present_hdr) ? 1
+                       : !hdr_out               ? 2
+                       : !hdr_pq                ? 3
+                       : image_format.format == kHdrFormat ? 4
+                                                           : 5;
+    const int previous = logged_hdr_choice.exchange(choice);
+    // Off from the start is not worth a line.
+    if (previous != choice && (choice != 1 || previous != 0)) {
+      REXLOG_INFO("VulkanPresenter: HDR presentation {}",
+                  choice == 5   ? (hdr_pq_dataspace
+                                       ? "uses a 10-bit swapchain marked HDR10"
+                                       : "uses an HDR10 swapchain (10-bit)")
+                  : choice == 4 ? "uses an HDR10 swapchain (16-bit float)"
+                  : choice == 3 ? "uses an scRGB swapchain"
+                  : choice == 2 ? "is not offered by the surface"
+                                : "is off");
+    }
+  }
+
+  // Get presentation modes.
+  std::vector<VkPresentModeKHR> present_modes;
+  VkResult present_modes_get_result;
+  for (;;) {
+    uint32_t present_mode_count = uint32_t(present_modes.size());
+    bool present_modes_were_empty = !present_mode_count;
+    present_modes_get_result = ifn.vkGetPhysicalDeviceSurfacePresentModesKHR(
+        physical_device, surface, &present_mode_count,
+        present_modes_were_empty ? nullptr : present_modes.data());
+    // If the original presentation mode count was 0 (first call), SUCCESS is
+    // returned, not INCOMPLETE.
+    if (present_modes_get_result == VK_SUCCESS || present_modes_get_result == VK_INCOMPLETE) {
+      present_modes.resize(present_mode_count);
+      if (present_modes_get_result == VK_SUCCESS &&
+          (!present_modes_were_empty || !present_mode_count)) {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  if (present_modes_get_result != VK_SUCCESS) {
+    // Assuming FIFO only (required everywhere) in case of an error.
+    present_modes.clear();
+  }
+
+  // Create the swapchain.
+  VkSwapchainCreateInfoKHR swapchain_create_info;
+  swapchain_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+  swapchain_create_info.pNext = nullptr;
+  swapchain_create_info.flags = 0;
+  swapchain_create_info.surface = surface;
+  // UP-4: the real and the generated image of a paint are held together,
+  // and the compositor may hold two more (gamescope does).
+  const VkImageUsageFlags frame_generation_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const bool frame_generation =
+      REXCVAR_GET(present_frame_generation) != "off" &&
+      (surface_capabilities.supportedUsageFlags & frame_generation_usage) ==
+          frame_generation_usage;
+  swapchain_create_info.minImageCount =
+      std::max(kSubmissionCount + (frame_generation ? 2u : 0u),
+               surface_capabilities.minImageCount);
+  if (surface_capabilities.maxImageCount) {
+    swapchain_create_info.minImageCount =
+        std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
+  }
+  swapchain_create_info.imageFormat = image_format.format;
+  swapchain_create_info.imageColorSpace = image_format.colorSpace;
+  swapchain_create_info.imageExtent = image_extent;
+  swapchain_create_info.imageArrayLayers = 1;
+  swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  const bool capturable =
+      REXCVAR_GET(present_capture_readable) &&
+      (surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  if (capturable) {
+    swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
+  if (frame_generation) {
+    swapchain_create_info.imageUsage |= frame_generation_usage;
+  }
+  uint32_t swapchain_queue_family_indices[2];
+  if (queue_family_index_graphics_compute != queue_family_index_present) {
+    // Using concurrent sharing mode to avoid an explicit ownership transfer
+    // before presenting, which would require an additional command buffer
+    // submission with the acquire barrier and a semaphore between the graphics
+    // queue and the present queue. Different queues are an extremely rare case,
+    // and Xenia only uses the swapchain for the final guest output and the
+    // internal UI, so keeping framebuffer compression is not worth the
+    // additional submission complexity and possibly latency.
+    swapchain_queue_family_indices[0] = queue_family_index_graphics_compute;
+    swapchain_queue_family_indices[1] = queue_family_index_present;
+    swapchain_create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+    swapchain_create_info.queueFamilyIndexCount = 2;
+    swapchain_create_info.pQueueFamilyIndices = swapchain_queue_family_indices;
+  } else {
+    swapchain_create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    swapchain_create_info.queueFamilyIndexCount = 0;
+    swapchain_create_info.pQueueFamilyIndices = nullptr;
+  }
+  swapchain_create_info.preTransform =
+      (surface_capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+          : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  uint32_t rotation = 0;
+#if REX_PLATFORM_ANDROID
+  // HDR10 only reaches the panel unrotated: take the display's transform and
+  // rotate in the last pass, which alone writes the HDR swapchain. The rest
+  // of the presenter keeps the unrotated extent (image_extent_out).
+  if (hdr_out && hdr_pq &&
+      (surface_capabilities.supportedTransforms & surface_capabilities.currentTransform)) {
+    const VkExtent2D rotated = {image_extent.height, image_extent.width};
+    const bool fits = rotated.width <= max_framebuffer_extent.width &&
+                      rotated.height <= max_framebuffer_extent.height;
+    if (fits && surface_capabilities.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) {
+      rotation = 1;
+    } else if (fits &&
+               surface_capabilities.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+      rotation = 2;
+    }
+    if (rotation) {
+      swapchain_create_info.preTransform = surface_capabilities.currentTransform;
+      swapchain_create_info.imageExtent = rotated;
+    }
+  }
+#endif
+  hdr_output_rotation.store(rotation, std::memory_order_relaxed);
+  // Prefer opaque to avoid blending in the window system, or let that be
+  // specified via the window system if it can't be forced. As a last resort,
+  // just pick any - guest output will write alpha of 1 anyway.
+  if (surface_capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
+    swapchain_create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+  } else if (surface_capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+    swapchain_create_info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+  } else {
+    uint32_t composite_alpha_shift;
+    if (!rex::bit_scan_forward(uint32_t(surface_capabilities.supportedCompositeAlpha),
+                               &composite_alpha_shift)) {
+      // Against the Vulkan specification, but breaks the logic here.
+      REXLOG_ERROR(
+          "VulkanPresenter: The surface doesn't support any composite alpha "
+          "mode");
+      return VK_NULL_HANDLE;
+    }
+    swapchain_create_info.compositeAlpha =
+        VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
+  }
+  // As presentation is usually controlled by the GPU command processor, it's
+  // better to use modes that allow as quick acquisition as possible to avoid
+  // interfering with GPU command processing, and also to allow tearing so
+  // variable refresh rate may be used where it's available.
+  // Note: If the priorities here are changes, update the cvar descriptions.
+  // vsync belongs to the command processor (in the GPU plugin, so it is read
+  // by name) and otherwise only paces the guest GPU: with it on, the two
+  // modes that tear are left out, so the swapchain is mailbox or FIFO, as
+  // Direct3D 12 presents without its tearing flag. Unregistered counts as on.
+  const bool vsync = rex::cvar::GetFlagByName("vsync") != "false";
+  if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+          present_modes.cend()) {
+    // Allowing tearing to reduce latency, and possibly variable refresh rate
+    // (though on Windows with borderless fullscreen, GDI copying is used
+    // instead of independent flip, so it's not supported there).
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) && !frame_generation &&
+             std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+                 present_modes.cend()) {
+    // UP-4.5: not with frame generation, which needs each of its two images
+    // shown for a refresh; mailbox replaced the generated one or needed a
+    // sleep between them (the Deck, 2026-11-16: 3-5x the late real frames
+    // and the GPU at its top clock).
+    // Allowing dropping frames to reduce latency, but no tearing.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
+             std::find(present_modes.cbegin(), present_modes.cend(),
+                       VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
+    // Limiting the frame rate, but lets too long frames cause tearing not to
+    // make the latency even worse.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  } else {
+    // Highest latency (but always guaranteed to be available).
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  }
+  swapchain_create_info.clipped = VK_TRUE;
+  swapchain_create_info.oldSwapchain = old_swapchain;
+  VkSwapchainKHR swapchain;
+  if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
+    return VK_NULL_HANDLE;
+  }
+  swapchain_capturable.store(capturable, std::memory_order_relaxed);
+  REXLOG_INFO(
+      "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
+      "{}, presentation mode {}, transform {} (display {})",
+      swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
+      uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
+      uint32_t(swapchain_create_info.presentMode), uint32_t(swapchain_create_info.preTransform),
+      uint32_t(surface_capabilities.currentTransform));
+
+  present_queue_family_out = queue_family_index_present;
+  image_format_out = swapchain_create_info.imageFormat;
+  image_extent_out = image_extent;
+  is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  frame_generation_out = frame_generation;
+  return swapchain;
+}
+
+VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+  if (swapchain != VK_NULL_HANDLE) {
+    REXLOG_INFO("VulkanPresenter: Retiring swapchain: waiting for drawing");
+    const bool drawing_complete = submission_tracker.AwaitAllSubmissionsCompletion();
+    REXLOG_INFO("VulkanPresenter: Retirement drawing complete={}; waiting for presentation queue",
+                drawing_complete);
+    // Draw fences don't cover vkQueuePresentKHR's semaphore waits.
+    // shortcut: queue idle is the unextended WSI fallback; use maintenance
+    // present fences when that extension is enabled.
+    assert_true(present_queue_family != UINT32_MAX);
+    const VulkanDevice::Queue::Acquisition queue =
+        vulkan_device->AcquireQueue(present_queue_family, 0);
+    const VkResult result = vulkan_device->functions().vkQueueWaitIdle(queue.queue());
+    if (result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Present queue drain failed during retirement: {}",
+                   int32_t(result));
+    } else {
+      REXLOG_INFO("VulkanPresenter: Retirement presentation queue drained");
+    }
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
+    dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
+    dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
+    dfn.vkDestroySemaphore(device, framebuffer.present_semaphore, nullptr);
+  }
+  swapchain_framebuffers.clear();
+  for (const HdrImage& hdr_image : hdr_images) {
+    dfn.vkDestroyFramebuffer(device, hdr_image.swapchain_framebuffer, nullptr);
+    dfn.vkDestroyImageView(device, hdr_image.swapchain_view, nullptr);
+    dfn.vkDestroyImageView(device, hdr_image.srgb_view, nullptr);
+    dfn.vkDestroyImage(device, hdr_image.image, nullptr);
+    dfn.vkFreeMemory(device, hdr_image.memory, nullptr);
+  }
+  hdr_images.clear();
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, hdr_descriptor_pool);
+  swapchain_images.clear();
+  swapchain_extent.width = 0;
+  swapchain_extent.height = 0;
+  // The old swapchain must be destroyed externally.
+  VkSwapchainKHR old_swapchain = swapchain;
+  swapchain = nullptr;
+  return old_swapchain;
+}
+
+void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+#if REX_PLATFORM_MAC
+  mac_metal_layer = nullptr;
+#endif
+  VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
+  if (old_swapchain != VK_NULL_HANDLE) {
+    vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
+                                                     nullptr);
+  }
+  present_queue_family = UINT32_MAX;
+  if (vulkan_surface != VK_NULL_HANDLE) {
+    const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
+    vulkan_instance->functions().vkDestroySurfaceKHR(vulkan_instance->instance(), vulkan_surface,
+                                                     nullptr);
+    vulkan_surface = VK_NULL_HANDLE;
+  }
+}
+
+VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  if (view_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, view_, nullptr);
+  }
+  if (image_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImage(device, image_, nullptr);
+  }
+  if (memory_ != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, memory_, nullptr);
+  }
+}
+
+bool VulkanPresenter::GuestOutputImage::Initialize() {
+  return CreateImage(image_, memory_, view_);
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureHudless() {
+  if (hudless_image_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (CreateImage(hudless_image_, hudless_memory_, hudless_view_)) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
+  return false;
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
+  if (depth_image_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  constexpr VkImageUsageFlags kUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  // R16G16_SFLOAT storage is an extended storage format.
+  VkFormatProperties motion_properties;
+  vulkan_device_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+      vulkan_device_->physical_device(), kGuestOutputMotionFormat, &motion_properties);
+  if ((motion_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+      CreateImage(depth_image_, depth_memory_, depth_view_, kGuestOutputDepthFormat, kUsage) &&
+      CreateImage(motion_image_, motion_memory_, motion_view_, kGuestOutputMotionFormat, kUsage)) {
+    return true;
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  return false;
+}
+
+bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemory& memory,
+                                                    VkImageView& view, VkFormat format,
+                                                    VkImageUsageFlags usage) {
+  VkImageCreateInfo image_create_info;
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.pNext = nullptr;
+  image_create_info.flags = 0;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = format;
+  image_create_info.extent.width = extent_.width;
+  image_create_info.extent.height = extent_.height;
+  image_create_info.extent.depth = 1;
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = usage;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.queueFamilyIndexCount = 0;
+  image_create_info.pQueueFamilyIndices = nullptr;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device_, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
+          memory)) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create a guest output image");
+    return false;
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkImageViewCreateInfo image_view_create_info;
+  image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  image_view_create_info.pNext = nullptr;
+  image_view_create_info.flags = 0;
+  image_view_create_info.image = image;
+  image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  image_view_create_info.format = format;
+  image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  image_view_create_info.subresourceRange.baseMipLevel = 0;
+  image_view_create_info.subresourceRange.levelCount = 1;
+  image_view_create_info.subresourceRange.baseArrayLayer = 0;
+  image_view_create_info.subresourceRange.layerCount = 1;
+  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &view) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create a guest output image view");
+    return false;
+  }
+
+  return true;
+}
+
+void VulkanPresenter::RecordPresentedCapture(VkCommandBuffer command_buffer,
+                                             uint32_t swapchain_image_index, VkFormat format,
+                                             VkExtent2D extent, uint64_t submission_index) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const uint32_t pixel_size = format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+  std::unique_lock<std::mutex> lock(presented_capture_mutex_, std::try_to_lock);
+  if (lock.owns_lock()) {
+    const VkDevice device = vulkan_device_->device();
+    if (presented_capture_buffer_extent_.width != extent.width ||
+        presented_capture_buffer_extent_.height != extent.height ||
+        presented_capture_buffer_pixel_size_ < pixel_size) {
+      if (presented_capture_buffer_ != VK_NULL_HANDLE) {
+        paint_context_.submission_tracker.AwaitSubmissionCompletion(
+            presented_capture_submission_);
+        util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, presented_capture_buffer_);
+        util::DestroyAndNullHandle(dfn.vkFreeMemory, device, presented_capture_memory_);
+      }
+      presented_capture_buffer_extent_ = {};
+      presented_capture_buffer_pixel_size_ = 0;
+      presented_capture_written_ = false;
+      if (util::CreateDedicatedAllocationBuffer(
+              vulkan_device_, VkDeviceSize(extent.width) * extent.height * pixel_size,
+              VK_BUFFER_USAGE_TRANSFER_DST_BIT, util::MemoryPurpose::kReadback,
+              presented_capture_buffer_, presented_capture_memory_)) {
+        presented_capture_buffer_extent_ = extent;
+        presented_capture_buffer_pixel_size_ = pixel_size;
+      }
+    }
+    if (presented_capture_buffer_ != VK_NULL_HANDLE) {
+      VkImageMemoryBarrier image_barrier = {};
+      image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      image_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      image_barrier.image = paint_context_.swapchain_images[swapchain_image_index];
+      image_barrier.subresourceRange = util::InitializeSubresourceRange();
+      dfn.vkCmdPipelineBarrier(command_buffer,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                               &image_barrier);
+      VkBufferImageCopy copy = {};
+      copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      copy.imageSubresource.layerCount = 1;
+      copy.imageExtent = {extent.width, extent.height, 1};
+      dfn.vkCmdCopyImageToBuffer(command_buffer, image_barrier.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, presented_capture_buffer_,
+                                 1, &copy);
+      VkBufferMemoryBarrier buffer_barrier = {};
+      buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+      buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.buffer = presented_capture_buffer_;
+      buffer_barrier.size = VK_WHOLE_SIZE;
+      image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      image_barrier.dstAccessMask = 0;
+      image_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               0, 0, nullptr, 1, &buffer_barrier, 1, &image_barrier);
+      presented_capture_extent_ = extent;
+      presented_capture_format_ = format;
+      presented_capture_submission_ = submission_index;
+      presented_capture_written_ = true;
+    }
+  }
+}
+
+void VulkanPresenter::RecordHdrOutput(VkCommandBuffer command_buffer,
+                                      uint32_t swapchain_image_index, uint32_t hdr_test_pattern) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  // The SDR stand-in, guest output and UI included, to the scRGB swapchain:
+  // sampled through its sRGB view as linear, and scaled so that white is the
+  // paper white (scRGB 1.0 is 80 nits), the scene's highlights expanded
+  // towards present_hdr_peak_nits where the alpha says it is not UI.
+  const PaintContext::HdrImage& hdr_image = paint_context_.hdr_images[swapchain_image_index];
+  VkRenderPassBeginInfo hdr_render_pass_begin_info = {};
+  hdr_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  hdr_render_pass_begin_info.renderPass = paint_context_.hdr_render_pass;
+  hdr_render_pass_begin_info.framebuffer = hdr_image.swapchain_framebuffer;
+  const VkExtent2D hdr_extent = HdrSwapchainImageExtent(paint_context_.swapchain_extent);
+  hdr_render_pass_begin_info.renderArea.extent = hdr_extent;
+  dfn.vkCmdBeginRenderPass(command_buffer, &hdr_render_pass_begin_info,
+                           VK_SUBPASS_CONTENTS_INLINE);
+  VkViewport hdr_viewport = {};
+  hdr_viewport.width = float(hdr_extent.width);
+  hdr_viewport.height = float(hdr_extent.height);
+  hdr_viewport.maxDepth = 1.0f;
+  VkRect2D hdr_scissor = {{0, 0}, hdr_extent};
+  dfn.vkCmdSetViewport(command_buffer, 0, 1, &hdr_viewport);
+  dfn.vkCmdSetScissor(command_buffer, 0, 1, &hdr_scissor);
+  dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        paint_context_.hdr_pipeline);
+  VkPipelineLayout hdr_pipeline_layout =
+      guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr];
+  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              hdr_pipeline_layout, 0, 1, &hdr_image.descriptor_set, 0, nullptr);
+  GuestOutputPaintRectangleConstants hdr_rect_constants;
+  hdr_rect_constants.x = -1.0f;
+  hdr_rect_constants.y = -1.0f;
+  hdr_rect_constants.width = 2.0f;
+  hdr_rect_constants.height = 2.0f;
+  dfn.vkCmdPushConstants(command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                         sizeof(hdr_rect_constants), &hdr_rect_constants);
+  HdrOutputConstants hdr_constants = {};
+  const double paper_white_nits = REXCVAR_GET(present_hdr_paper_white_nits);
+  const double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
+  hdr_constants.paper_white_scale = float(paper_white_nits / 80.0);
+  // SDR white in the scene goes this far from the paper white to the peak.
+  hdr_constants.highlight_scale = float(
+      std::max(peak_nits / paper_white_nits - 1.0, 0.0) *
+      std::clamp(REXCVAR_GET(present_hdr_highlights), 0.0, 1.0));
+  // Linear SDR brightness where the expansion starts (0.5 is 73 % in sRGB).
+  hdr_constants.knee = 0.5f;
+  hdr_constants.knee_range_inv = 1.0f / (1.0f - hdr_constants.knee);
+  hdr_constants.gamma = float(REXCVAR_GET(present_hdr_gamma));
+  // Mostly the largest channel: a red brake light (luminance 0.21) expands
+  // nearly as a white one; deep colored surfaces stay below the knee.
+  hdr_constants.max_channel_weight = 0.75f;
+  hdr_constants.pattern = hdr_test_pattern;
+  // Compare returns before drawing patterns in the shader; calibration must
+  // cover both halves without changing the player's compare setting.
+  hdr_constants.compare_x =
+      REXCVAR_GET(present_hdr_compare) && !hdr_constants.pattern
+          ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
+  hdr_constants.pattern_value = float(peak_nits / 80.0);
+  static thread_local HdrOutputConstants logged_pattern = {};
+  if (hdr_constants.pattern &&
+      (hdr_constants.pattern != logged_pattern.pattern ||
+       hdr_constants.paper_white_scale != logged_pattern.paper_white_scale ||
+       hdr_constants.pattern_value != logged_pattern.pattern_value ||
+       hdr_constants.gamma != logged_pattern.gamma)) {
+    REXLOG_INFO("VulkanPresenter: HDR calibration pattern {}, paper white {} nits, "
+                "peak {} nits, gamma {}; compare suspended; levels are signal values",
+                hdr_constants.pattern, paper_white_nits, peak_nits, hdr_constants.gamma);
+  }
+  logged_pattern = hdr_constants;
+  hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
+                               (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
+  hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
+  hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
+  dfn.vkCmdPushConstants(command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                         sizeof(hdr_rect_constants), sizeof(hdr_constants), &hdr_constants);
+  dfn.vkCmdDraw(command_buffer, 4, 1, 0, 0);
+  dfn.vkCmdEndRenderPass(command_buffer);
+}
+
+Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // present_hdr switched (#442): recreate the swapchain in the other format
+  // through the reconnection. Where the surface offers no scRGB, nothing
+  // changes.
+  if (REXCVAR_GET(present_hdr) != paint_context_.swapchain_hdr &&
+      (paint_context_.swapchain_hdr || hdr_output_offered.load(std::memory_order_relaxed))) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+  // UP-4: frame generation turned on needs swapchain images it can copy and
+  // one more of them; made once (a surface without them stays without).
+  if (REXCVAR_GET(present_frame_generation) != "off" &&
+      !paint_context_.swapchain_frame_generation_requested) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+  // Begin the submission in place of the one not currently potentially used on
+  // the GPU.
+  uint64_t current_paint_submission_index =
+      paint_context_.submission_tracker.GetCurrentSubmission();
+  uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
+  if (current_paint_submission_index >= paint_submission_count) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
+                                                                paint_submission_count);
+  }
+  const PaintContext::Submission& paint_submission =
+      *paint_context_.submissions[current_paint_submission_index % paint_submission_count];
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkCommandPool draw_command_pool = paint_submission.draw_command_pool();
+  if (dfn.vkResetCommandPool(device, draw_command_pool, 0) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to reset a command buffer for drawing to the "
+        "swapchain");
+    return PaintResult::kNotPresented;
+  }
+
+  VkCommandBuffer draw_command_buffer = paint_submission.draw_command_buffer();
+  VkCommandBufferBeginInfo command_buffer_begin_info;
+  command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  command_buffer_begin_info.pNext = nullptr;
+  command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  command_buffer_begin_info.pInheritanceInfo = nullptr;
+  if (dfn.vkBeginCommandBuffer(draw_command_buffer, &command_buffer_begin_info) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to being recording the command buffer for "
+        "drawing to the swapchain");
+    return PaintResult::kNotPresented;
+  }
+  // vkResetCommandPool resets from both initial and recording states, still
+  // safe to return early from this function in case of an error.
+
+#if REX_PLATFORM_MAC
+  SyncMacMetalLayerDrawableSize(paint_context_.mac_metal_layer, paint_context_.swapchain_extent);
+#endif
+  VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+  uint32_t swapchain_image_index;
+  // Keep pumping window events even if an occluded surface stops making
+  // progress; this may run on the UI thread or the submission worker.
+  VkResult acquire_result =
+      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(50000000),
+                                acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
+  switch (acquire_result) {
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+      return PaintResult::kNotPresented;
+    case VK_SUCCESS:
+    case VK_SUBOPTIMAL_KHR:
+      break;
+    case VK_ERROR_DEVICE_LOST:
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to acquire the swapchain image as the "
+          "device has been lost");
+      return PaintResult::kGpuLostResponsible;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+    case VK_ERROR_SURFACE_LOST_KHR:
+    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+      // Not an error, reporting just as info (may normally occur while resizing
+      // on some platforms).
+      REXLOG_INFO(
+          "VulkanPresenter: Presentation to the swapchain image has been "
+          "dropped as the swapchain or the surface has become outdated");
+      return PaintResult::kNotPresentedConnectionOutdated;
+    default:
+      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+      return PaintResult::kNotPresented;
+  }
+
+  // Non-zero extents needed for both the viewport (width must not be zero) and
+  // the guest output rectangle.
+  assert_not_zero(paint_context_.swapchain_extent.width);
+  assert_not_zero(paint_context_.swapchain_extent.height);
+
+  bool swapchain_image_clear_needed = true;
+  VkClearAttachment swapchain_image_clear_attachment;
+  swapchain_image_clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  swapchain_image_clear_attachment.colorAttachment = 0;
+  swapchain_image_clear_attachment.clearValue.color.float32[0] = 0.0f;
+  swapchain_image_clear_attachment.clearValue.color.float32[1] = 0.0f;
+  swapchain_image_clear_attachment.clearValue.color.float32[2] = 0.0f;
+  swapchain_image_clear_attachment.clearValue.color.float32[3] = 1.0f;
+
+  VkRenderPassBeginInfo swapchain_render_pass_begin_info;
+  swapchain_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  swapchain_render_pass_begin_info.pNext = nullptr;
+  swapchain_render_pass_begin_info.renderPass = paint_context_.swapchain_render_pass;
+  swapchain_render_pass_begin_info.framebuffer =
+      paint_context_.swapchain_framebuffers[swapchain_image_index].framebuffer;
+  swapchain_render_pass_begin_info.renderArea.offset.x = 0;
+  swapchain_render_pass_begin_info.renderArea.offset.y = 0;
+  swapchain_render_pass_begin_info.renderArea.extent = paint_context_.swapchain_extent;
+  swapchain_render_pass_begin_info.clearValueCount = 0;
+  swapchain_render_pass_begin_info.pClearValues = nullptr;
+  if (paint_context_.swapchain_render_pass_clear_load_op) {
+    swapchain_render_pass_begin_info.clearValueCount = 1;
+    swapchain_render_pass_begin_info.pClearValues = &swapchain_image_clear_attachment.clearValue;
+    swapchain_image_clear_needed = false;
+  }
+
+  bool swapchain_image_pass_begun = false;
+
+  GuestOutputProperties guest_output_properties;
+  GuestOutputPaintConfig guest_output_paint_config;
+  std::shared_ptr<GuestOutputImage> guest_output_image;
+  uint64_t guest_output_refresh_serial = 0;
+  bool guest_output_hudless = false;
+  bool guest_output_camera_valid = false;
+  UpscalerCamera guest_output_camera;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+        guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
+      guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
+      guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
+      guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
+      guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
+    }
+    // Incremented the reference count of the guest output image - safe to leave
+    // the consumer critical section now as everything here either will be using
+    // the new reference or is exclusively owned by main target painting (and
+    // multiple threads can't paint the main target at the same time).
+  }
+
+  // UP-4: the size of the guest frame, once it is painted this time.
+  uint32_t frame_generation_render_width = 0;
+  uint32_t frame_generation_render_height = 0;
+  // UP-4: keep the game's HUD and the host UI out of the generated frames:
+  // the frame is copied for the provider after the guest output is painted
+  // and before the UI (the HUD drawn back over it after the copy where it is
+  // deferred), and the swapchain pass then continues with a loading pass.
+  const bool frame_generation_compose =
+      GetFrameGenerator() != nullptr &&
+      paint_context_.swapchain_load_render_pass != VK_NULL_HANDLE &&
+      REXCVAR_GET(present_frame_generation_hud);
+  guest_output_hud_mask_wanted_.store(frame_generation_compose, std::memory_order_relaxed);
+  VkPipeline frame_generation_mask_pipeline = paint_context_.swapchain_hdr
+                                                  ? paint_context_.hdr_ui_mask_pipeline
+                                                  : VK_NULL_HANDLE;
+  if (frame_generation_compose && !paint_context_.swapchain_hdr) {
+    if (frame_generation_mask_render_pass_ != paint_context_.swapchain_render_pass) {
+      if (frame_generation_mask_pipeline_ != VK_NULL_HANDLE) {
+        paint_context_.submission_tracker.AwaitSubmissionCompletion(
+            frame_generation_mask_last_submission_);
+        util::DestroyAndNullHandle(vulkan_device_->functions().vkDestroyPipeline,
+                                   vulkan_device_->device(), frame_generation_mask_pipeline_);
+      }
+      if (hdr_ui_mask_fs_ == VK_NULL_HANDLE) {
+        VkShaderModuleCreateInfo module_info = {};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = sizeof(shaders::hdr_ui_mask_ps);
+        module_info.pCode = shaders::hdr_ui_mask_ps;
+        if (vulkan_device_->functions().vkCreateShaderModule(
+                vulkan_device_->device(), &module_info, nullptr, &hdr_ui_mask_fs_) != VK_SUCCESS) {
+          hdr_ui_mask_fs_ = VK_NULL_HANDLE;
+        }
+      }
+      if (hdr_ui_mask_fs_ != VK_NULL_HANDLE) {
+        frame_generation_mask_pipeline_ = CreateGuestOutputPaintPipeline(
+            GuestOutputPaintEffect::kBilinear, paint_context_.swapchain_render_pass,
+            hdr_ui_mask_fs_, VK_COLOR_COMPONENT_A_BIT);
+      }
+      frame_generation_mask_render_pass_ = paint_context_.swapchain_render_pass;
+    }
+    frame_generation_mask_pipeline = frame_generation_mask_pipeline_;
+    frame_generation_mask_last_submission_ = current_paint_submission_index;
+  }
+  // Recorded when the guest output is painted with frame_generation_compose.
+  bool frame_generation_input_pending = false;
+  FrameGenerationHud frame_generation_hud;
+  bool frame_generation_hud_deferred = false;
+  SetPaintedGuestOutputRect(nullptr);
+  if (guest_output_image) {
+    VkExtent2D max_framebuffer_extent =
+        util::GetMax2DFramebufferExtent(vulkan_device_->properties());
+    GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+        guest_output_properties, paint_context_.swapchain_extent.width,
+        paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
+        max_framebuffer_extent.height, guest_output_paint_config);
+    SetPaintedGuestOutputRect(&guest_output_flow);
+    if (guest_output_flow.effect_count) {
+      // Store the main target reference to the guest output image so it's not
+      // destroyed while it's still potentially in use by main target painting
+      // queued on the GPU.
+      size_t guest_output_image_paint_ref_index = SIZE_MAX;
+      size_t guest_output_image_paint_ref_new_index = SIZE_MAX;
+      // Try to find the existing reference to the same image, or an already
+      // released (or a taken, but never actually used) slot.
+      for (size_t i = 0; i < paint_context_.guest_output_image_paint_refs.size(); ++i) {
+        const std::pair<uint64_t, std::shared_ptr<GuestOutputImage>>& guest_output_image_paint_ref =
+            paint_context_.guest_output_image_paint_refs[i];
+        if (guest_output_image_paint_ref.second == guest_output_image) {
+          guest_output_image_paint_ref_index = i;
+          break;
+        }
+        if (guest_output_image_paint_ref_new_index == SIZE_MAX &&
+            (!guest_output_image_paint_ref.second || !guest_output_image_paint_ref.first)) {
+          guest_output_image_paint_ref_new_index = i;
+        }
+      }
+      if (guest_output_image_paint_ref_index == SIZE_MAX) {
+        // New image - store the reference and create the descriptors.
+        if (guest_output_image_paint_ref_new_index == SIZE_MAX) {
+          // Replace the earliest used reference.
+          guest_output_image_paint_ref_new_index = 0;
+          for (size_t i = 1; i < paint_context_.guest_output_image_paint_refs.size(); ++i) {
+            if (paint_context_.guest_output_image_paint_refs[i].first <
+                paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
+                    .first) {
+              guest_output_image_paint_ref_new_index = i;
+            }
+          }
+          // Await the completion of the usage of the old guest output image and
+          // its descriptors.
+          paint_context_.submission_tracker.AwaitSubmissionCompletion(
+              paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
+                  .first);
+        }
+        guest_output_image_paint_ref_index = guest_output_image_paint_ref_new_index;
+        // The actual submission index will be set if the image is actually
+        // used, not dropped due to some error.
+        paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index] =
+            std::make_pair(uint64_t(0), guest_output_image);
+        // Create the descriptors of the new image.
+        VkDescriptorImageInfo guest_output_image_descriptor_image_info;
+        guest_output_image_descriptor_image_info.sampler = VK_NULL_HANDLE;
+        guest_output_image_descriptor_image_info.imageView = guest_output_image->view();
+        guest_output_image_descriptor_image_info.imageLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet guest_output_image_descriptor_write;
+        guest_output_image_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        guest_output_image_descriptor_write.pNext = nullptr;
+        guest_output_image_descriptor_write.dstSet =
+            paint_context_.guest_output_descriptor_sets
+                [PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+                 guest_output_image_paint_ref_index];
+        guest_output_image_descriptor_write.dstBinding = 0;
+        guest_output_image_descriptor_write.dstArrayElement = 0;
+        guest_output_image_descriptor_write.descriptorCount = 1;
+        guest_output_image_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        guest_output_image_descriptor_write.pImageInfo = &guest_output_image_descriptor_image_info;
+        guest_output_image_descriptor_write.pBufferInfo = nullptr;
+        guest_output_image_descriptor_write.pTexelBufferView = nullptr;
+        dfn.vkUpdateDescriptorSets(device, 1, &guest_output_image_descriptor_write, 0, nullptr);
+      }
+
+      // Make sure intermediate textures of the needed size are available, and
+      // unneeded intermediate textures are destroyed.
+      for (size_t i = 0; i < kMaxGuestOutputPaintEffects - 1; ++i) {
+        std::pair<uint32_t, uint32_t> intermediate_needed_size(0, 0);
+        if (i + 1 < guest_output_flow.effect_count) {
+          intermediate_needed_size = guest_output_flow.effect_output_sizes[i];
+        }
+        std::unique_ptr<GuestOutputImage>& intermediate_image_ptr_ref =
+            paint_context_.guest_output_intermediate_images[i];
+        VkExtent2D intermediate_current_extent(
+            intermediate_image_ptr_ref ? intermediate_image_ptr_ref->extent() : VkExtent2D{});
+        if (intermediate_current_extent.width != intermediate_needed_size.first ||
+            intermediate_current_extent.height != intermediate_needed_size.second) {
+          if (intermediate_needed_size.first && intermediate_needed_size.second) {
+            // Need to replace immediately as a new image with the requested
+            // size is needed.
+            if (intermediate_image_ptr_ref) {
+              paint_context_.submission_tracker.AwaitSubmissionCompletion(
+                  paint_context_.guest_output_intermediate_image_last_submission);
+              intermediate_image_ptr_ref.reset();
+              util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+                                         paint_context_.guest_output_intermediate_framebuffers[i]);
+            }
+            // Image.
+            intermediate_image_ptr_ref = GuestOutputImage::Create(
+                vulkan_device_, intermediate_needed_size.first, intermediate_needed_size.second);
+            if (!intermediate_image_ptr_ref) {
+              // Don't display the guest output, and don't try to create more
+              // intermediate textures (only destroy them).
+              guest_output_flow.effect_count = 0;
+              continue;
+            }
+            // Framebuffer.
+            VkImageView intermediate_framebuffer_attachment = intermediate_image_ptr_ref->view();
+            VkFramebufferCreateInfo intermediate_framebuffer_create_info;
+            intermediate_framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            intermediate_framebuffer_create_info.pNext = nullptr;
+            intermediate_framebuffer_create_info.flags = 0;
+            intermediate_framebuffer_create_info.renderPass =
+                guest_output_intermediate_render_pass_;
+            intermediate_framebuffer_create_info.attachmentCount = 1;
+            intermediate_framebuffer_create_info.pAttachments =
+                &intermediate_framebuffer_attachment;
+            intermediate_framebuffer_create_info.width = intermediate_needed_size.first;
+            intermediate_framebuffer_create_info.height = intermediate_needed_size.second;
+            intermediate_framebuffer_create_info.layers = 1;
+            if (dfn.vkCreateFramebuffer(
+                    device, &intermediate_framebuffer_create_info, nullptr,
+                    &paint_context_.guest_output_intermediate_framebuffers[i]) != VK_SUCCESS) {
+              REXLOG_ERROR(
+                  "VulkanPresenter: Failed to create a guest output "
+                  "intermediate framebuffer");
+              // Don't display the guest output, and don't try to create more
+              // intermediate textures (only destroy them).
+              guest_output_flow.effect_count = 0;
+              continue;
+            }
+            // Descriptors.
+            VkDescriptorImageInfo intermediate_descriptor_image_info;
+            intermediate_descriptor_image_info.sampler = VK_NULL_HANDLE;
+            intermediate_descriptor_image_info.imageView = intermediate_image_ptr_ref->view();
+            intermediate_descriptor_image_info.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkWriteDescriptorSet intermediate_descriptor_write;
+            intermediate_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            intermediate_descriptor_write.pNext = nullptr;
+            intermediate_descriptor_write.dstSet =
+                paint_context_.guest_output_descriptor_sets
+                    [PaintContext ::kGuestOutputDescriptorSetIntermediate0Sampled + i];
+            intermediate_descriptor_write.dstBinding = 0;
+            intermediate_descriptor_write.dstArrayElement = 0;
+            intermediate_descriptor_write.descriptorCount = 1;
+            intermediate_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            intermediate_descriptor_write.pImageInfo = &intermediate_descriptor_image_info;
+            intermediate_descriptor_write.pBufferInfo = nullptr;
+            intermediate_descriptor_write.pTexelBufferView = nullptr;
+            dfn.vkUpdateDescriptorSets(device, 1, &intermediate_descriptor_write, 0, nullptr);
+          } else {
+            // Was previously needed, but not anymore - destroy when possible.
+            if (intermediate_image_ptr_ref &&
+                paint_context_.submission_tracker.UpdateAndGetCompletedSubmission() >=
+                    paint_context_.guest_output_intermediate_image_last_submission) {
+              intermediate_image_ptr_ref.reset();
+              util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+                                         paint_context_.guest_output_intermediate_framebuffers[i]);
+            }
+          }
+        }
+      }
+
+      if (guest_output_flow.effect_count) {
+        // Check if all the intermediate effects are supported by the
+        // implementation.
+        for (size_t i = 0; i + 1 < guest_output_flow.effect_count; ++i) {
+          if (paint_context_.guest_output_paint_pipelines[size_t(guest_output_flow.effects[i])]
+                  .intermediate_pipeline == VK_NULL_HANDLE) {
+            guest_output_flow.effect_count = 0;
+            break;
+          }
+        }
+        if (guest_output_flow.effect_count) {
+          // Ensure the pipeline exists for the final effect drawing to the
+          // swapchain, for the render pass with the up-to-date image format.
+          GuestOutputPaintEffect swapchain_effect =
+              guest_output_flow.effects[guest_output_flow.effect_count - 1];
+          PaintContext::GuestOutputPaintPipeline& swapchain_effect_pipeline =
+              paint_context_.guest_output_paint_pipelines[size_t(swapchain_effect)];
+          if (swapchain_effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE &&
+              swapchain_effect_pipeline.swapchain_format !=
+                  paint_context_.swapchain_render_pass_format) {
+            paint_context_.submission_tracker.AwaitSubmissionCompletion(
+                paint_context_.guest_output_image_paint_last_submission);
+            util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                       swapchain_effect_pipeline.swapchain_pipeline);
+          }
+          if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+            assert_true(CanGuestOutputPaintEffectBeFinal(swapchain_effect));
+            assert_true(guest_output_paint_fs_[size_t(swapchain_effect)] != VK_NULL_HANDLE);
+            swapchain_effect_pipeline.swapchain_pipeline = CreateGuestOutputPaintPipeline(
+                swapchain_effect, paint_context_.swapchain_render_pass);
+            if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+              guest_output_flow.effect_count = 0;
+            } else {
+              // Without this the format check above never matched, and every
+              // present waited for the previous one and built the pipeline
+              // again.
+              swapchain_effect_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
+            }
+          }
+        }
+      }
+
+      if (guest_output_flow.effect_count) {
+        // Actually draw the guest output.
+        paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index].first =
+            current_paint_submission_index;
+        paint_context_.guest_output_image_paint_last_submission = current_paint_submission_index;
+        guest_output_flow.GetEffectInputSize(0, frame_generation_render_width,
+                                             frame_generation_render_height);
+        VkViewport guest_output_viewport;
+        guest_output_viewport.x = 0.0f;
+        guest_output_viewport.y = 0.0f;
+        guest_output_viewport.minDepth = 0.0f;
+        guest_output_viewport.maxDepth = 1.0f;
+        VkRect2D guest_output_scissor;
+        guest_output_scissor.offset.x = 0;
+        guest_output_scissor.offset.y = 0;
+        if (guest_output_flow.effect_count > 1) {
+          paint_context_.guest_output_intermediate_image_last_submission =
+              current_paint_submission_index;
+        }
+        // The flow puts a temporal upscale in an EASU slot; without a usable
+        // provider, the slot stays FSR 1 EASU.
+        VulkanUpscaler* temporal_upscaler = GetTemporalUpscaler(guest_output_paint_config);
+        // UP-1.2: the upscaler reads the guest output without the HUD when
+        // the refresher wrote that copy, which it can only do for the guest
+        // output itself (the temporal slot first in the flow).
+        const std::string& hud_mode = REXCVAR_GET(present_upscaler_hud);
+        const bool hudless_allowed = hud_mode != "off";
+        const bool temporal_reads_guest_output =
+            temporal_upscaler && guest_output_flow.effect_count > 1 &&
+            guest_output_flow.effects[0] == GuestOutputPaintEffect::kFsrEasu;
+        const bool camera_allowed = REXCVAR_GET(present_upscaler_camera);
+        hudless_guest_output_wanted_.store(hudless_allowed && temporal_reads_guest_output,
+                                           std::memory_order_relaxed);
+        // UP-4: frame generation reads the same depth and camera motion.
+        const bool frame_generation_wanted = paint_context_.swapchain_frame_generation &&
+                                             REXCVAR_GET(present_frame_generation) != "off";
+        guest_output_camera_wanted_.store(
+            camera_allowed && (temporal_reads_guest_output || frame_generation_wanted),
+            std::memory_order_relaxed);
+        // A Halton(2, 3) sequence of 8 samples per output pixel, the length
+        // FSR and DLSS recommend for the upscaling ratio.
+        uint32_t jitter_phases = 0;
+        if (camera_allowed && temporal_reads_guest_output && REXCVAR_GET(present_upscaler_jitter)) {
+          uint32_t jitter_input_width = 0, jitter_input_height = 0;
+          guest_output_flow.GetEffectInputSize(0, jitter_input_width, jitter_input_height);
+          if (jitter_input_width) {
+            const float ratio =
+                float(guest_output_flow.effect_output_sizes[0].first) / float(jitter_input_width);
+            jitter_phases = std::max(1u, uint32_t(std::ceil(8.0f * ratio * ratio)));
+          }
+        }
+        guest_output_jitter_phases_.store(jitter_phases, std::memory_order_relaxed);
+        SetTemporalUpscalerActive(temporal_reads_guest_output);
+        for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
+          bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
+          GuestOutputPaintEffect effect = guest_output_flow.effects[i];
+
+          std::pair<uint32_t, uint32_t> effect_rect_size = guest_output_flow.effect_output_sizes[i];
+          if (is_final_effect && guest_output_flow.output_x == 0 &&
+              guest_output_flow.output_y == 0 &&
+              effect_rect_size.first < paint_context_.swapchain_extent.width &&
+              effect_rect_size.second < paint_context_.swapchain_extent.height) {
+            static std::atomic<bool> logged_swapchain_expand = false;
+            if (!logged_swapchain_expand.exchange(true)) {
+              REXLOG_WARN(
+                  "VulkanPresenter: expanding final guest output rect from "
+                  "{}x{} to swapchain {}x{} to avoid top-left-only output",
+                  effect_rect_size.first, effect_rect_size.second,
+                  paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+            }
+            effect_rect_size = std::make_pair(paint_context_.swapchain_extent.width,
+                                              paint_context_.swapchain_extent.height);
+            // Keep all final-pass data coherent - shader constants and
+            // letterbox clears are derived from guest_output_flow.
+            guest_output_flow.effect_output_sizes[i] = effect_rect_size;
+            guest_output_flow.output_x = 0;
+            guest_output_flow.output_y = 0;
+            guest_output_flow.letterbox_clear_rectangle_count = 0;
+          }
+          bool use_temporal_upscaler =
+              temporal_upscaler && effect == GuestOutputPaintEffect::kFsrEasu;
+          if (use_temporal_upscaler && !is_final_effect) {
+            const GuestOutputImage& source =
+                i ? *paint_context_.guest_output_intermediate_images[i - 1] : *guest_output_image;
+            const GuestOutputImage& output = *paint_context_.guest_output_intermediate_images[i];
+            const bool use_hudless = hudless_allowed && i == 0 && guest_output_hudless &&
+                                     source.hudless_image() != VK_NULL_HANDLE;
+            const bool use_camera = camera_allowed && i == 0 && guest_output_camera_valid &&
+                                    source.depth_image() != VK_NULL_HANDLE;
+            // UP-4: the HUD goes over the painted frame after the frame
+            // generation input is copied, not into the upscale.
+            const bool defer_hud = frame_generation_compose && use_hudless &&
+                                   hud_mode == "composite" && EnsureFrameGenerationCompose();
+            if (defer_hud) {
+              uint32_t hud_input_width = 0, hud_input_height = 0;
+              guest_output_flow.GetEffectInputSize(i, hud_input_width, hud_input_height);
+              frame_generation_hud.frame_view = source.view();
+              frame_generation_hud.hudless_view = source.hudless_view();
+              frame_generation_hud.source_uv_scale[0] =
+                  float(hud_input_width) / float(source.extent().width);
+              frame_generation_hud.source_uv_scale[1] =
+                  float(hud_input_height) / float(source.extent().height);
+              frame_generation_hud_deferred = true;
+            }
+            VkImage source_image = use_hudless ? source.hudless_image() : source.image();
+            VkImageView source_view = use_hudless ? source.hudless_view() : source.view();
+            VkImage output_image = output.image();
+            uint32_t effect_input_width = 0, effect_input_height = 0;
+            guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
+            // A repaint without a new guest frame (a display faster than
+            // the game, a window event) shows the last upscale again, left in
+            // the shader-read layout: the same frame fed twice would count as
+            // a still camera in the provider's history.
+            if (temporal_upscale_.output_valid && temporal_upscale_.upscaler == temporal_upscaler &&
+                temporal_upscale_.output_image == output_image &&
+                temporal_upscale_.refresh_serial == guest_output_refresh_serial &&
+                temporal_upscale_.source_width == effect_input_width &&
+                temporal_upscale_.source_height == effect_input_height &&
+                temporal_upscale_.output_width == effect_rect_size.first &&
+                temporal_upscale_.output_height == effect_rect_size.second) {
+              ++temporal_upscale_.repeat_count;
+              continue;
+            }
+
+            VkImageMemoryBarrier barrier_to_uav = {};
+            barrier_to_uav.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier_to_uav.srcAccessMask = 0;
+            barrier_to_uav.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier_to_uav.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier_to_uav.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier_to_uav.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier_to_uav.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier_to_uav.image = output_image;
+            barrier_to_uav.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier_to_uav.subresourceRange.baseMipLevel = 0;
+            barrier_to_uav.subresourceRange.levelCount = 1;
+            barrier_to_uav.subresourceRange.baseArrayLayer = 0;
+            barrier_to_uav.subresourceRange.layerCount = 1;
+            dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 1, &barrier_to_uav);
+
+            if (DispatchTemporalUpscaler(draw_command_buffer, *temporal_upscaler, source_image,
+                                         source_view, effect_input_width, effect_input_height,
+                                         output_image, output.view(), effect_rect_size.first,
+                                         effect_rect_size.second, guest_output_refresh_serial,
+                                         guest_output_paint_config, use_camera ? &source : nullptr,
+                                         use_camera ? &guest_output_camera : nullptr)) {
+              const std::string& view_mode = REXCVAR_GET(present_upscaler_view);
+              const uint32_t debug_view =
+                  !use_camera ? 0u : view_mode == "depth" ? 1u : view_mode == "motion" ? 2u : 0u;
+              if (debug_view && EnsureUpscaleHudComposite()) {
+                VkImageMemoryBarrier barrier_to_view = {};
+                barrier_to_view.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier_to_view.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_view.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_view.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_view.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_view.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_view.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_view.image = output_image;
+                barrier_to_view.subresourceRange = util::InitializeSubresourceRange();
+                dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                         nullptr, 1, &barrier_to_view);
+                VkDescriptorSet view_set =
+                    upscale_hud_composite_sets_[current_paint_submission_index %
+                                                upscale_hud_composite_sets_.size()];
+                const VkSampler nearest_sampler =
+                    ui_samplers_->samplers()[UISamplers::kSamplerIndexNearestClampToEdge];
+                VkDescriptorImageInfo view_images[3] = {
+                    {nearest_sampler, source.depth_view(), kGuestOutputInternalLayout},
+                    {nearest_sampler, source.motion_view(), kGuestOutputInternalLayout},
+                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
+                };
+                VkWriteDescriptorSet view_writes[3] = {};
+                for (uint32_t j = 0; j < 3; ++j) {
+                  view_writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                  view_writes[j].dstSet = view_set;
+                  view_writes[j].dstBinding = j;
+                  view_writes[j].descriptorCount = 1;
+                  view_writes[j].descriptorType = j == 2
+                                                      ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                      : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                  view_writes[j].pImageInfo = &view_images[j];
+                }
+                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, view_writes, 0, nullptr);
+                struct {
+                  uint32_t output_size[2];
+                  float output_size_inv[2];
+                  float source_uv_scale[2];
+                  float render_size[2];
+                  float near_plane;
+                  float far_plane;
+                  float motion_gain;
+                  uint32_t mode;
+                } view_constants = {
+                    {effect_rect_size.first, effect_rect_size.second},
+                    {1.0f / float(effect_rect_size.first), 1.0f / float(effect_rect_size.second)},
+                    {float(effect_input_width) / float(source.extent().width),
+                     float(effect_input_height) / float(source.extent().height)},
+                    {float(effect_input_width), float(effect_input_height)},
+                    guest_output_camera.near_plane,
+                    guest_output_camera.far_plane,
+                    0.05f,
+                    debug_view};
+                dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      upscale_debug_view_pipeline_);
+                dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            upscale_hud_composite_pipeline_layout_, 0, 1,
+                                            &view_set, 0, nullptr);
+                dfn.vkCmdPushConstants(draw_command_buffer,
+                                       upscale_hud_composite_pipeline_layout_,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(view_constants),
+                                       &view_constants);
+                dfn.vkCmdDispatch(draw_command_buffer, (effect_rect_size.first + 15) / 16,
+                                  (effect_rect_size.second + 7) / 8, 1);
+              } else if (use_hudless && hud_mode == "composite" && !defer_hud &&
+                         EnsureUpscaleHudComposite()) {
+                VkImageMemoryBarrier barrier_to_composite = {};
+                barrier_to_composite.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier_to_composite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_composite.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_composite.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_composite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_composite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_composite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_composite.image = output_image;
+                barrier_to_composite.subresourceRange = util::InitializeSubresourceRange();
+                dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                         nullptr, 1, &barrier_to_composite);
+                VkDescriptorSet composite_set =
+                    upscale_hud_composite_sets_[current_paint_submission_index %
+                                                upscale_hud_composite_sets_.size()];
+                const VkSampler linear_sampler =
+                    ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+                VkDescriptorImageInfo composite_images[3] = {
+                    {linear_sampler, source.view(), kGuestOutputInternalLayout},
+                    {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
+                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
+                };
+                VkWriteDescriptorSet composite_writes[3] = {};
+                for (uint32_t j = 0; j < 3; ++j) {
+                  composite_writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                  composite_writes[j].dstSet = composite_set;
+                  composite_writes[j].dstBinding = j;
+                  composite_writes[j].descriptorCount = 1;
+                  composite_writes[j].descriptorType =
+                      j == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                  composite_writes[j].pImageInfo = &composite_images[j];
+                }
+                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, composite_writes, 0,
+                                           nullptr);
+                struct {
+                  uint32_t output_size[2];
+                  float output_size_inv[2];
+                  float source_uv_scale[2];
+                } composite_constants = {
+                    {effect_rect_size.first, effect_rect_size.second},
+                    {1.0f / float(effect_rect_size.first), 1.0f / float(effect_rect_size.second)},
+                    {float(effect_input_width) / float(source.extent().width),
+                     float(effect_input_height) / float(source.extent().height)}};
+                dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      upscale_hud_composite_pipeline_);
+                dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            upscale_hud_composite_pipeline_layout_, 0, 1,
+                                            &composite_set, 0, nullptr);
+                dfn.vkCmdPushConstants(draw_command_buffer,
+                                       upscale_hud_composite_pipeline_layout_,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(composite_constants), &composite_constants);
+                dfn.vkCmdDispatch(draw_command_buffer, (effect_rect_size.first + 15) / 16,
+                                  (effect_rect_size.second + 7) / 8, 1);
+              }
+              VkImageMemoryBarrier barrier_to_shader_read = {};
+              barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+              barrier_to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+              barrier_to_shader_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+              barrier_to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              barrier_to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier_to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier_to_shader_read.image = output_image;
+              barrier_to_shader_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              barrier_to_shader_read.subresourceRange.baseMipLevel = 0;
+              barrier_to_shader_read.subresourceRange.levelCount = 1;
+              barrier_to_shader_read.subresourceRange.baseArrayLayer = 0;
+              barrier_to_shader_read.subresourceRange.layerCount = 1;
+              dfn.vkCmdPipelineBarrier(
+                  draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                  0, nullptr, 0, nullptr, 1, &barrier_to_shader_read);
+              continue;
+            }
+          }
+
+          int32_t effect_rect_x, effect_rect_y;
+          if (is_final_effect) {
+            effect_rect_x = guest_output_flow.output_x;
+            effect_rect_y = guest_output_flow.output_y;
+            dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
+                                     VK_SUBPASS_CONTENTS_INLINE);
+            swapchain_image_pass_begun = true;
+            guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
+            guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
+            guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
+            guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
+          } else {
+            effect_rect_x = 0;
+            effect_rect_y = 0;
+            VkRenderPassBeginInfo intermediate_render_pass_begin_info;
+            intermediate_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            intermediate_render_pass_begin_info.pNext = nullptr;
+            intermediate_render_pass_begin_info.renderPass = guest_output_intermediate_render_pass_;
+            intermediate_render_pass_begin_info.framebuffer =
+                paint_context_.guest_output_intermediate_framebuffers[i];
+            intermediate_render_pass_begin_info.renderArea.offset.x = 0;
+            intermediate_render_pass_begin_info.renderArea.offset.y = 0;
+            intermediate_render_pass_begin_info.renderArea.extent.width = effect_rect_size.first;
+            intermediate_render_pass_begin_info.renderArea.extent.height = effect_rect_size.second;
+            intermediate_render_pass_begin_info.clearValueCount = 0;
+            intermediate_render_pass_begin_info.pClearValues = nullptr;
+            dfn.vkCmdBeginRenderPass(draw_command_buffer, &intermediate_render_pass_begin_info,
+                                     VK_SUBPASS_CONTENTS_INLINE);
+            guest_output_viewport.width = float(effect_rect_size.first);
+            guest_output_viewport.height = float(effect_rect_size.second);
+            guest_output_scissor.extent.width = effect_rect_size.first;
+            guest_output_scissor.extent.height = effect_rect_size.second;
+          }
+          dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &guest_output_viewport);
+          dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &guest_output_scissor);
+
+          const PaintContext::GuestOutputPaintPipeline& effect_pipeline =
+              paint_context_.guest_output_paint_pipelines[size_t(effect)];
+          VkPipeline effect_vulkan_pipeline = is_final_effect
+                                                  ? effect_pipeline.swapchain_pipeline
+                                                  : effect_pipeline.intermediate_pipeline;
+          assert_true(effect_vulkan_pipeline != VK_NULL_HANDLE);
+          dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                effect_vulkan_pipeline);
+
+          GuestOutputPaintPipelineLayoutIndex guest_output_paint_pipeline_layout_index =
+              GetGuestOutputPaintPipelineLayoutIndex(effect);
+          VkPipelineLayout guest_output_paint_pipeline_layout =
+              guest_output_paint_pipeline_layouts_[guest_output_paint_pipeline_layout_index];
+
+          PaintContext::GuestOutputDescriptorSet effect_src_descriptor_set;
+          if (i) {
+            effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
+                PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled + (i - 1));
+          } else {
+            effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
+                PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+                guest_output_image_paint_ref_index);
+          }
+          dfn.vkCmdBindDescriptorSets(
+              draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+              guest_output_paint_pipeline_layout, 0, 1,
+              &paint_context_.guest_output_descriptor_sets[effect_src_descriptor_set], 0, nullptr);
+
+          GuestOutputPaintRectangleConstants effect_rect_constants;
+          float effect_x_to_ndc = 2.0f / guest_output_viewport.width;
+          float effect_y_to_ndc = 2.0f / guest_output_viewport.height;
+          effect_rect_constants.x = -1.0f + float(effect_rect_x) * effect_x_to_ndc;
+          effect_rect_constants.y = -1.0f + float(effect_rect_y) * effect_y_to_ndc;
+          effect_rect_constants.width = float(effect_rect_size.first) * effect_x_to_ndc;
+          effect_rect_constants.height = float(effect_rect_size.second) * effect_y_to_ndc;
+          dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
+                                 VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),
+                                 &effect_rect_constants);
+
+          uint32_t effect_constants_size = 0;
+          union {
+            BilinearConstants bilinear;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+            CasSharpenConstants cas_sharpen;
+            CasResampleConstants cas_resample;
+            FsrEasuConstants fsr_easu;
+            FsrRcasConstants fsr_rcas;
+#endif
+          } effect_constants;
+          switch (guest_output_paint_pipeline_layout_index) {
+            case kGuestOutputPaintPipelineLayoutIndexBilinear: {
+              effect_constants_size = sizeof(effect_constants.bilinear);
+              effect_constants.bilinear.Initialize(guest_output_flow, i);
+            } break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+            case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
+              effect_constants_size = sizeof(effect_constants.cas_sharpen);
+              effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
+                                                      guest_output_paint_config);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexCasResample: {
+              effect_constants_size = sizeof(effect_constants.cas_resample);
+              effect_constants.cas_resample.Initialize(guest_output_flow, i,
+                                                       guest_output_paint_config);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexFsrEasu: {
+              effect_constants_size = sizeof(effect_constants.fsr_easu);
+              effect_constants.fsr_easu.Initialize(guest_output_flow, i);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexFsrRcas: {
+              effect_constants_size = sizeof(effect_constants.fsr_rcas);
+              effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
+            } break;
+#endif
+            default:
+              break;
+          }
+          if (effect_constants_size) {
+            dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(effect_rect_constants),
+                                   effect_constants_size, &effect_constants);
+          }
+
+          dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+
+          if (is_final_effect && frame_generation_mask_pipeline != VK_NULL_HANDLE &&
+              (paint_context_.swapchain_hdr || frame_generation_compose)) {
+            // The effects write an opaque alpha; the HDR pass, and frame
+            // generation, read the HUD coverage of the guest output from it
+            // instead.
+            VkPipelineLayout mask_pipeline_layout =
+                guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexBilinear];
+            dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  frame_generation_mask_pipeline);
+            dfn.vkCmdBindDescriptorSets(
+                draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mask_pipeline_layout, 0, 1,
+                &paint_context_.guest_output_descriptor_sets
+                     [PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+                      guest_output_image_paint_ref_index],
+                0, nullptr);
+            dfn.vkCmdPushConstants(draw_command_buffer, mask_pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),
+                                   &effect_rect_constants);
+            BilinearConstants mask_constants;
+            mask_constants.Initialize(guest_output_flow, i);
+            dfn.vkCmdPushConstants(draw_command_buffer, mask_pipeline_layout,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(effect_rect_constants),
+                                   sizeof(mask_constants), &mask_constants);
+            dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+          }
+
+          if (is_final_effect) {
+            // Clear the letterbox around the guest output if the guest output
+            // doesn't cover the entire swapchain image.
+            if (swapchain_image_clear_needed && guest_output_flow.letterbox_clear_rectangle_count) {
+              VkClearRect
+                  letterbox_clear_vulkan_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];
+              for (size_t i = 0; i < guest_output_flow.letterbox_clear_rectangle_count; ++i) {
+                VkClearRect& letterbox_clear_vulkan_rectangle =
+                    letterbox_clear_vulkan_rectangles[i];
+                const GuestOutputPaintFlow::ClearRectangle& letterbox_clear_rectangle =
+                    guest_output_flow.letterbox_clear_rectangles[i];
+                letterbox_clear_vulkan_rectangle.rect.offset.x =
+                    int32_t(letterbox_clear_rectangle.x);
+                letterbox_clear_vulkan_rectangle.rect.offset.y =
+                    int32_t(letterbox_clear_rectangle.y);
+                letterbox_clear_vulkan_rectangle.rect.extent.width =
+                    letterbox_clear_rectangle.width;
+                letterbox_clear_vulkan_rectangle.rect.extent.height =
+                    letterbox_clear_rectangle.height;
+                letterbox_clear_vulkan_rectangle.baseArrayLayer = 0;
+                letterbox_clear_vulkan_rectangle.layerCount = 1;
+              }
+              dfn.vkCmdClearAttachments(draw_command_buffer, 1, &swapchain_image_clear_attachment,
+                                        uint32_t(guest_output_flow.letterbox_clear_rectangle_count),
+                                        letterbox_clear_vulkan_rectangles);
+            }
+            swapchain_image_clear_needed = false;
+            if (frame_generation_compose && frame_generation_mask_pipeline != VK_NULL_HANDLE) {
+              frame_generation_input_pending = true;
+              frame_generation_hud.rect_x = effect_rect_x;
+              frame_generation_hud.rect_y = effect_rect_y;
+              frame_generation_hud.rect_width = effect_rect_size.first;
+              frame_generation_hud.rect_height = effect_rect_size.second;
+            }
+          } else {
+            // Still need the swapchain pass to be open for UI drawing.
+            dfn.vkCmdEndRenderPass(draw_command_buffer);
+          }
+        }
+      }
+    }
+  }
+
+  // Release main target guest output image references that aren't needed
+  // anymore (this is done after various potential guest-output-related main
+  // target submission tracker waits so the completed submission value is the
+  // most actual).
+  uint64_t completed_paint_submission =
+      paint_context_.submission_tracker.UpdateAndGetCompletedSubmission();
+  for (std::pair<uint64_t, std::shared_ptr<GuestOutputImage>>& guest_output_image_paint_ref :
+       paint_context_.guest_output_image_paint_refs) {
+    if (!guest_output_image_paint_ref.second ||
+        guest_output_image_paint_ref.second == guest_output_image) {
+      continue;
+    }
+    if (completed_paint_submission >= guest_output_image_paint_ref.first) {
+      guest_output_image_paint_ref.second.reset();
+    }
+  }
+
+  // UP-4: the frame generation input, before the UI, then the same image
+  // again in a loading pass.
+  if (frame_generation_input_pending && swapchain_image_pass_begun) {
+    dfn.vkCmdEndRenderPass(draw_command_buffer);
+    RecordFrameGenerationInput(draw_command_buffer, swapchain_image_index,
+                               frame_generation_hud_deferred ? &frame_generation_hud : nullptr,
+                               current_paint_submission_index);
+    VkRenderPassBeginInfo load_render_pass_begin_info = swapchain_render_pass_begin_info;
+    load_render_pass_begin_info.renderPass = paint_context_.swapchain_load_render_pass;
+    dfn.vkCmdBeginRenderPass(draw_command_buffer, &load_render_pass_begin_info,
+                             VK_SUBPASS_CONTENTS_INLINE);
+  } else {
+    frame_generation_.input_recorded = false;
+  }
+
+  // If hasn't presented the guest output, begin the pass to clear and, if
+  // needed, to draw the UI.
+  if (!swapchain_image_pass_begun) {
+    dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
+                             VK_SUBPASS_CONTENTS_INLINE);
+  }
+  const uint32_t hdr_test_pattern =
+      uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+  const bool hdr_calibration = paint_context_.swapchain_hdr && hdr_test_pattern != 0;
+  if (swapchain_image_clear_needed || hdr_calibration) {
+    // Patterns replace the guest, including its HUD mask. Only the host UI
+    // drawn below may cover them, even on a menu frame whose guest mask is 1.
+    swapchain_image_clear_attachment.clearValue.color.float32[3] = hdr_calibration ? 0.0f : 1.0f;
+    VkClearRect swapchain_image_clear_rectangle;
+    swapchain_image_clear_rectangle.rect.offset.x = 0;
+    swapchain_image_clear_rectangle.rect.offset.y = 0;
+    swapchain_image_clear_rectangle.rect.extent = paint_context_.swapchain_extent;
+    swapchain_image_clear_rectangle.baseArrayLayer = 0;
+    swapchain_image_clear_rectangle.layerCount = 1;
+    dfn.vkCmdClearAttachments(draw_command_buffer, 1, &swapchain_image_clear_attachment, 1,
+                              &swapchain_image_clear_rectangle);
+    swapchain_image_clear_needed = false;
+  }
+
+  if (execute_ui_drawers) {
+    // Draw the UI.
+    VulkanUIDrawContext ui_draw_context(
+        *this, paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height,
+        draw_command_buffer, ui_submission_tracker_.GetCurrentSubmission(),
+        ui_submission_tracker_.UpdateAndGetCompletedSubmission(),
+        paint_context_.swapchain_render_pass, paint_context_.swapchain_render_pass_format);
+    ExecuteUIDrawersFromUIThread(ui_draw_context);
+  }
+
+  dfn.vkCmdEndRenderPass(draw_command_buffer);
+
+  // CapturePresentedOutput: keep a copy of each finished SDR image.
+  if (!paint_context_.swapchain_hdr && swapchain_capturable.load(std::memory_order_relaxed)) {
+    RecordPresentedCapture(draw_command_buffer, swapchain_image_index,
+                           paint_context_.swapchain_render_pass_format,
+                           paint_context_.swapchain_extent, current_paint_submission_index);
+  }
+
+  if (paint_context_.swapchain_hdr) {
+    RecordHdrOutput(draw_command_buffer, swapchain_image_index, hdr_test_pattern);
+    // And of each finished HDR image, after the HDR pass.
+    if (swapchain_capturable.load(std::memory_order_relaxed)) {
+      RecordPresentedCapture(draw_command_buffer, swapchain_image_index,
+                             paint_context_.swapchain_image_format,
+                             HdrSwapchainImageExtent(paint_context_.swapchain_extent),
+                             current_paint_submission_index);
+    }
+  }
+
+  uint32_t generated_image_index = UINT32_MAX;
+  if (frame_generation_render_width) {
+    frame_generation_.render_width = frame_generation_render_width;
+    frame_generation_.render_height = frame_generation_render_height;
+  }
+  if (!frame_generation_render_width && paint_context_.swapchain_frame_generation &&
+      REXCVAR_GET(present_frame_generation) != "off") {
+    ++frame_generation_.skipped_no_size;
+  }
+  const bool frame_generated =
+      frame_generation_render_width &&
+      RecordFrameGeneration(draw_command_buffer,
+                            paint_submission.frame_generation_acquire_semaphore(),
+                            swapchain_image_index, guest_output_image.get(),
+                            guest_output_refresh_serial,
+                            guest_output_camera_valid ? &guest_output_camera : nullptr,
+                            frame_generation_render_width, frame_generation_render_height,
+                            current_paint_submission_index, generated_image_index);
+  if (frame_generated && paint_context_.swapchain_hdr) {
+    RecordHdrOutput(draw_command_buffer, generated_image_index, hdr_test_pattern);
+    // Debug: the generated HDR image replaces the real one in the capture.
+    if (REXCVAR_GET(present_frame_generation_capture) != 0 &&
+        swapchain_capturable.load(std::memory_order_relaxed)) {
+      RecordPresentedCapture(draw_command_buffer, generated_image_index,
+                             paint_context_.swapchain_image_format,
+                             HdrSwapchainImageExtent(paint_context_.swapchain_extent),
+                             current_paint_submission_index);
+    }
+  }
+
+  dfn.vkEndCommandBuffer(draw_command_buffer);
+
+  VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkCommandBuffer command_buffers[2];
+  uint32_t command_buffer_count = 0;
+  // UI setup command buffers must be accessed only if execute_ui_drawers is not
+  // null, to identify the UI thread.
+  size_t ui_setup_command_buffer_index =
+      execute_ui_drawers ? paint_context_.ui_setup_command_buffer_current_index : SIZE_MAX;
+  if (ui_setup_command_buffer_index != SIZE_MAX) {
+    PaintContext::UISetupCommandBuffer& ui_setup_command_buffer =
+        paint_context_.ui_setup_command_buffers[ui_setup_command_buffer_index];
+    dfn.vkEndCommandBuffer(ui_setup_command_buffer.command_buffer);
+    command_buffers[command_buffer_count++] = ui_setup_command_buffer.command_buffer;
+    // Release the current UI setup command buffer regardless of submission
+    // result. Failed submissions (if the UI submission index wasn't incremented
+    // since the previous draw) should be handled by UI drawers themselves by
+    // retrying all the failed work if needed.
+    paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
+  }
+  command_buffers[command_buffer_count++] = draw_command_buffer;
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
+  // UP-4: a generated frame's image is acquired and presented on its own.
+  const VkSemaphore wait_semaphores[2] = {acquire_semaphore,
+                                          paint_submission.frame_generation_acquire_semaphore()};
+  const VkPipelineStageFlags wait_stages[2] = {acquire_semaphore_wait_stage,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT};
+  const VkSemaphore generated_present_semaphore =
+      frame_generated
+          ? paint_context_.swapchain_framebuffers[generated_image_index].present_semaphore
+          : VK_NULL_HANDLE;
+  const VkSemaphore signal_semaphores[2] = {present_semaphore, generated_present_semaphore};
+  VkSubmitInfo submit_info;
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.pNext = nullptr;
+  submit_info.waitSemaphoreCount = frame_generated ? 2 : 1;
+  submit_info.pWaitSemaphores = wait_semaphores;
+  submit_info.pWaitDstStageMask = wait_stages;
+  submit_info.commandBufferCount = command_buffer_count;
+  submit_info.pCommandBuffers = command_buffers;
+  submit_info.signalSemaphoreCount = frame_generated ? 2 : 1;
+  submit_info.pSignalSemaphores = signal_semaphores;
+  {
+    VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
+        paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
+    // Also update the submission tracker giving submission indices to UI draw
+    // callbacks if submission is successful.
+    VulkanSubmissionTracker::FenceAcquisition ui_fence_acquisition;
+    if (execute_ui_drawers) {
+      ui_fence_acquisition = ui_submission_tracker_.AcquireFenceToAdvanceSubmission();
+    }
+    VkResult submit_result;
+    {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+      submit_result =
+          dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+      if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
+        if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
+                              ui_fence_acquisition.fence()) != VK_SUCCESS) {
+          ui_fence_acquisition.SubmissionSucceededSignalFailed();
+        }
+      }
+    }
+    if (submit_result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers: {}", int32_t(submit_result));
+      fence_acqusition.SubmissionFailedOrDropped();
+      ui_fence_acquisition.SubmissionFailedOrDropped();
+      if (ui_setup_command_buffer_index != SIZE_MAX) {
+        // If failed to submit, make the UI setup command buffer available for
+        // immediate reuse, as the completed submission index won't be updated
+        // to the current index, and failing submissions with setup command
+        // buffer over and over will result in never reusing the setup command
+        // buffers.
+        paint_context_.ui_setup_command_buffers[ui_setup_command_buffer_index]
+            .last_usage_submission_index = 0;
+      }
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        return PaintResult::kGpuLostResponsible;
+      }
+      // The image is in an acquired state - but now, it will be in it forever.
+      // To avoid that, recreate the swapchain - don't return just
+      // kNotPresented.
+      return PaintResult::kNotPresentedConnectionOutdated;
+    }
+  }
+
+  auto present_image = [&](uint32_t image_index, VkSemaphore wait_semaphore) {
+    VkPresentInfoKHR present_info;
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.pNext = nullptr;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &wait_semaphore;
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = &paint_context_.swapchain;
+    present_info.pImageIndices = &image_index;
+    present_info.pResults = nullptr;
+    // IDs grow on each swapchain (a new swapchain starts again from 1).
+    VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+    uint64_t present_id = 0;
+    const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
+    if (device_properties.presentId && device_properties.presentWait &&
+        REXCVAR_GET(vulkan_present_wait)) {
+      present_id = ++paint_context_.swapchain_last_present_id;
+      present_id_info.swapchainCount = 1;
+      present_id_info.pPresentIds = &present_id;
+      present_info.pNext = &present_id_info;
+    }
+    VkResult result;
+    {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+      result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+    }
+    if (present_id > 1 && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
+      // At most one present in flight: the previous one must have reached the
+      // display before the next frame is painted. With frame generation this
+      // also spaces the two presents of a paint by a refresh under FIFO.
+      dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
+                              UINT64_C(50000000));
+    }
+    return result;
+  };
+  VkResult present_result;
+  if (frame_generated) {
+    // The generated frame first, the real one half a real frame later.
+    const auto generated_time = std::chrono::steady_clock::now();
+    present_result = present_image(generated_image_index, generated_present_semaphore);
+    if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+      ++frame_generation_.total_generated_presents;
+      NoteFrameGenerationPresent(true);
+      if (!paint_context_.swapchain_is_fifo) {
+        // Without FIFO nothing spaces the two presents: wait here.
+        const float half_ms = std::clamp(frame_generation_.interval_ms * 0.5f, 0.0f, 25.0f);
+        std::this_thread::sleep_until(
+            generated_time + std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
+      }
+      frame_generation_.gap_ms_sum += std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - generated_time)
+                                          .count();
+      present_result = present_image(swapchain_image_index, present_semaphore);
+    }
+  } else {
+    present_result = present_image(swapchain_image_index, present_semaphore);
+  }
+  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    ++frame_generation_.total_real_presents;
+    if (paint_context_.swapchain_frame_generation) {
+      NoteFrameGenerationPresent(false);
+    }
+  }
+  switch (present_result) {
+    case VK_SUCCESS:
+      return PaintResult::kPresented;
+    case VK_SUBOPTIMAL_KHR:
+      return PaintResult::kPresentedSuboptimal;
+    case VK_ERROR_DEVICE_LOST:
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to present the swapchain image as the "
+          "device has been lost");
+      return PaintResult::kGpuLostResponsible;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+    case VK_ERROR_SURFACE_LOST_KHR:
+    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+      // Not an error, reporting just as info (may normally occur while resizing
+      // on some platforms).
+      REXLOG_INFO(
+          "VulkanPresenter: Presentation to the swapchain image has been "
+          "dropped as the swapchain or the surface has become outdated");
+      // Note that the semaphore wait (followed by reset) has been enqueued,
+      // however, this should have no effect on anything here likely.
+      return PaintResult::kNotPresentedConnectionOutdated;
+    default:
+      REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image");
+      // The image is in an acquired state - but now, it will be in it forever.
+      // To avoid that, recreate the swapchain - don't return just
+      // kNotPresented.
+      return PaintResult::kNotPresentedConnectionOutdated;
+  }
+}
+
+bool VulkanPresenter::InitializeSurfaceIndependent() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
+  guest_output_image_sampler_bindings[0].binding = 0;
+  guest_output_image_sampler_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  guest_output_image_sampler_bindings[0].descriptorCount = 1;
+  guest_output_image_sampler_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  guest_output_image_sampler_bindings[0].pImmutableSamplers = nullptr;
+  const VkSampler sampler_linear_clamp =
+      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+  guest_output_image_sampler_bindings[1].binding = 1;
+  guest_output_image_sampler_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  guest_output_image_sampler_bindings[1].descriptorCount = 1;
+  guest_output_image_sampler_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  guest_output_image_sampler_bindings[1].pImmutableSamplers = &sampler_linear_clamp;
+  VkDescriptorSetLayoutCreateInfo guest_output_paint_image_descriptor_set_layout_create_info;
+  guest_output_paint_image_descriptor_set_layout_create_info.sType =
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  guest_output_paint_image_descriptor_set_layout_create_info.pNext = nullptr;
+  guest_output_paint_image_descriptor_set_layout_create_info.flags = 0;
+  guest_output_paint_image_descriptor_set_layout_create_info.bindingCount =
+      uint32_t(rex::countof(guest_output_image_sampler_bindings));
+  guest_output_paint_image_descriptor_set_layout_create_info.pBindings =
+      guest_output_image_sampler_bindings;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &guest_output_paint_image_descriptor_set_layout_create_info, nullptr,
+          &guest_output_paint_image_descriptor_set_layout_) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create the guest output image descriptor "
+        "set layout");
+    return false;
+  }
+
+  VkPushConstantRange guest_output_paint_push_constant_ranges[2];
+  VkPushConstantRange& guest_output_paint_push_constant_range_rect =
+      guest_output_paint_push_constant_ranges[0];
+  guest_output_paint_push_constant_range_rect.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  guest_output_paint_push_constant_range_rect.offset = 0;
+  guest_output_paint_push_constant_range_rect.size = sizeof(GuestOutputPaintRectangleConstants);
+  VkPushConstantRange& guest_output_paint_push_constant_range_ffx =
+      guest_output_paint_push_constant_ranges[1];
+  guest_output_paint_push_constant_range_ffx.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  guest_output_paint_push_constant_range_ffx.offset =
+      guest_output_paint_push_constant_ranges[0].offset +
+      guest_output_paint_push_constant_ranges[0].size;
+  VkPipelineLayoutCreateInfo guest_output_paint_pipeline_layout_create_info;
+  guest_output_paint_pipeline_layout_create_info.sType =
+      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  guest_output_paint_pipeline_layout_create_info.pNext = nullptr;
+  guest_output_paint_pipeline_layout_create_info.flags = 0;
+  guest_output_paint_pipeline_layout_create_info.setLayoutCount = 1;
+  guest_output_paint_pipeline_layout_create_info.pSetLayouts =
+      &guest_output_paint_image_descriptor_set_layout_;
+  guest_output_paint_pipeline_layout_create_info.pPushConstantRanges =
+      guest_output_paint_push_constant_ranges;
+  for (size_t i = 0; i < size_t(kGuestOutputPaintPipelineLayoutCount); ++i) {
+    switch (GuestOutputPaintPipelineLayoutIndex(i)) {
+      case kGuestOutputPaintPipelineLayoutIndexBilinear:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
+        break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+      case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
+        break;
+      case kGuestOutputPaintPipelineLayoutIndexCasResample:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(CasResampleConstants);
+        break;
+      case kGuestOutputPaintPipelineLayoutIndexFsrEasu:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(FsrEasuConstants);
+        break;
+      case kGuestOutputPaintPipelineLayoutIndexFsrRcas:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(FsrRcasConstants);
+        break;
+#endif
+      case kGuestOutputPaintPipelineLayoutIndexHdr:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(HdrOutputConstants);
+        break;
+      default:
+        assert_unhandled_case(GuestOutputPaintPipelineLayoutIndex(i));
+        continue;
+    }
+    guest_output_paint_pipeline_layout_create_info.pushConstantRangeCount =
+        1 + uint32_t(guest_output_paint_push_constant_range_ffx.size != 0);
+    if (dfn.vkCreatePipelineLayout(device, &guest_output_paint_pipeline_layout_create_info, nullptr,
+                                   &guest_output_paint_pipeline_layouts_[i]) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create a guest output presentation "
+          "pipeline layout with {} bytes of push constants",
+          guest_output_paint_push_constant_range_rect.size +
+              guest_output_paint_push_constant_range_ffx.size);
+      return false;
+    }
+  }
+
+  VkShaderModuleCreateInfo shader_module_create_info;
+  shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  shader_module_create_info.pNext = nullptr;
+  shader_module_create_info.flags = 0;
+  shader_module_create_info.codeSize = sizeof(shaders::guest_output_triangle_strip_rect_vs);
+  shader_module_create_info.pCode = shaders::guest_output_triangle_strip_rect_vs;
+  if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
+                               &guest_output_paint_vs_) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create the guest output presentation "
+        "vertex shader module");
+    return false;
+  }
+  for (size_t i = 0; i < size_t(GuestOutputPaintEffect::kCount); ++i) {
+    GuestOutputPaintEffect guest_output_paint_effect = GuestOutputPaintEffect(i);
+    switch (guest_output_paint_effect) {
+      case GuestOutputPaintEffect::kBilinear:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_ps);
+        shader_module_create_info.pCode = shaders::guest_output_bilinear_ps;
+        break;
+      case GuestOutputPaintEffect::kBilinearDither:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
+        break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+      case GuestOutputPaintEffect::kCasSharpen:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_sharpen_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_cas_sharpen_ps;
+        break;
+      case GuestOutputPaintEffect::kCasSharpenDither:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_ffx_cas_sharpen_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_cas_sharpen_dither_ps;
+        break;
+      case GuestOutputPaintEffect::kCasResample:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_resample_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_cas_resample_ps;
+        break;
+      case GuestOutputPaintEffect::kCasResampleDither:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_ffx_cas_resample_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_cas_resample_dither_ps;
+        break;
+      case GuestOutputPaintEffect::kFsrEasu:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_fsr_easu_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_easu_ps;
+        break;
+      case GuestOutputPaintEffect::kFsrRcas:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_fsr_rcas_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_ps;
+        break;
+      case GuestOutputPaintEffect::kFsrRcasDither:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_dither_ps;
+        break;
+#endif
+      default:
+        // Not supported by this implementation.
+        continue;
+    }
+    if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
+                                 &guest_output_paint_fs_[i]) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create the guest output painting shader "
+          "module for effect {}",
+          i);
+      return false;
+    }
+  }
+
+  VkAttachmentDescription intermediate_render_pass_attachment;
+  intermediate_render_pass_attachment.flags = 0;
+  intermediate_render_pass_attachment.format = kGuestOutputFormat;
+  intermediate_render_pass_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+  intermediate_render_pass_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  intermediate_render_pass_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  intermediate_render_pass_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  intermediate_render_pass_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  intermediate_render_pass_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  intermediate_render_pass_attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkAttachmentReference intermediate_render_pass_color_attachment;
+  intermediate_render_pass_color_attachment.attachment = 0;
+  intermediate_render_pass_color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  VkSubpassDescription intermediate_render_pass_subpass = {};
+  intermediate_render_pass_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  intermediate_render_pass_subpass.colorAttachmentCount = 1;
+  intermediate_render_pass_subpass.pColorAttachments = &intermediate_render_pass_color_attachment;
+  VkSubpassDependency intermediate_render_pass_dependencies[2];
+  intermediate_render_pass_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+  intermediate_render_pass_dependencies[0].dstSubpass = 0;
+  intermediate_render_pass_dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  intermediate_render_pass_dependencies[0].dstStageMask =
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  intermediate_render_pass_dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  intermediate_render_pass_dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  intermediate_render_pass_dependencies[0].dependencyFlags = 0;
+  intermediate_render_pass_dependencies[1].srcSubpass = 0;
+  intermediate_render_pass_dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+  intermediate_render_pass_dependencies[1].srcStageMask =
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  intermediate_render_pass_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  intermediate_render_pass_dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  intermediate_render_pass_dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  intermediate_render_pass_dependencies[1].dependencyFlags = 0;
+  VkRenderPassCreateInfo intermediate_render_pass_create_info;
+  intermediate_render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+  intermediate_render_pass_create_info.pNext = nullptr;
+  intermediate_render_pass_create_info.flags = 0;
+  intermediate_render_pass_create_info.attachmentCount = 1;
+  intermediate_render_pass_create_info.pAttachments = &intermediate_render_pass_attachment;
+  intermediate_render_pass_create_info.subpassCount = 1;
+  intermediate_render_pass_create_info.pSubpasses = &intermediate_render_pass_subpass;
+  intermediate_render_pass_create_info.dependencyCount =
+      uint32_t(rex::countof(intermediate_render_pass_dependencies));
+  intermediate_render_pass_create_info.pDependencies = intermediate_render_pass_dependencies;
+  if (dfn.vkCreateRenderPass(device, &intermediate_render_pass_create_info, nullptr,
+                             &guest_output_intermediate_render_pass_) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create the guest output intermediate image "
+        "render pass");
+    return false;
+  }
+
+  // Initialize connection-independent parts of the painting context.
+
+  for (size_t i = 0; i < paint_context_.submissions.size(); ++i) {
+    paint_context_.submissions[i] = PaintContext::Submission::Create(vulkan_device_);
+    if (!paint_context_.submissions[i]) {
+      return false;
+    }
+  }
+
+  // Guest output paint pipelines drawing to intermediate images, not depending
+  // on runtime state unlike ones drawing to the swapchain images as those
+  // depend on the swapchain format.
+  for (size_t i = 0; i < size_t(GuestOutputPaintEffect::kCount); ++i) {
+    if (!CanGuestOutputPaintEffectBeIntermediate(GuestOutputPaintEffect(i)) ||
+        guest_output_paint_fs_[i] == VK_NULL_HANDLE) {
+      continue;
+    }
+    VkPipeline guest_output_paint_intermediate_pipeline = CreateGuestOutputPaintPipeline(
+        GuestOutputPaintEffect(i), guest_output_intermediate_render_pass_);
+    if (guest_output_paint_intermediate_pipeline == VK_NULL_HANDLE) {
+      return false;
+    }
+    paint_context_.guest_output_paint_pipelines[i].intermediate_pipeline =
+        guest_output_paint_intermediate_pipeline;
+  }
+
+  // Guest output painting descriptor sets.
+  VkDescriptorPoolSize guest_output_paint_descriptor_pool_sizes[2];
+  guest_output_paint_descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  guest_output_paint_descriptor_pool_sizes[0].descriptorCount =
+      PaintContext::kGuestOutputDescriptorSetCount;
+  // Required even when using immutable samplers, otherwise failing to allocate
+  // descriptor sets (tested on AMD Software: Adrenalin Edition 22.3.2 on
+  // Windows 10 on AMD Radeon RX Vega 10 with Vulkan validation enabled).
+  guest_output_paint_descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+  guest_output_paint_descriptor_pool_sizes[1].descriptorCount =
+      PaintContext::kGuestOutputDescriptorSetCount;
+  VkDescriptorPoolCreateInfo guest_output_paint_descriptor_pool_create_info;
+  guest_output_paint_descriptor_pool_create_info.sType =
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  guest_output_paint_descriptor_pool_create_info.pNext = nullptr;
+  guest_output_paint_descriptor_pool_create_info.flags = 0;
+  guest_output_paint_descriptor_pool_create_info.maxSets =
+      PaintContext::kGuestOutputDescriptorSetCount;
+  guest_output_paint_descriptor_pool_create_info.poolSizeCount =
+      uint32_t(rex::countof(guest_output_paint_descriptor_pool_sizes));
+  guest_output_paint_descriptor_pool_create_info.pPoolSizes =
+      guest_output_paint_descriptor_pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &guest_output_paint_descriptor_pool_create_info, nullptr,
+                                 &paint_context_.guest_output_descriptor_pool) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create the guest output painting "
+        "descriptor pool");
+    return false;
+  }
+  VkDescriptorSetLayout
+      guest_output_paint_descriptor_set_layouts[PaintContext::kGuestOutputDescriptorSetCount];
+  std::fill(guest_output_paint_descriptor_set_layouts,
+            guest_output_paint_descriptor_set_layouts +
+                rex::countof(guest_output_paint_descriptor_set_layouts),
+            guest_output_paint_image_descriptor_set_layout_);
+  VkDescriptorSetAllocateInfo guest_output_paint_descriptor_set_allocate_info;
+  guest_output_paint_descriptor_set_allocate_info.sType =
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  guest_output_paint_descriptor_set_allocate_info.pNext = nullptr;
+  guest_output_paint_descriptor_set_allocate_info.descriptorPool =
+      paint_context_.guest_output_descriptor_pool;
+  guest_output_paint_descriptor_set_allocate_info.descriptorSetCount =
+      PaintContext::kGuestOutputDescriptorSetCount;
+  guest_output_paint_descriptor_set_allocate_info.pSetLayouts =
+      guest_output_paint_descriptor_set_layouts;
+  if (dfn.vkAllocateDescriptorSets(device, &guest_output_paint_descriptor_set_allocate_info,
+                                   paint_context_.guest_output_descriptor_sets) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to allocate the guest output painting "
+        "descriptor sets");
+    return false;
+  }
+
+  upscalers_ = CreateVulkanUpscalers(vulkan_device_);
+  if (std::unique_ptr<VulkanFrameGenerator> generator =
+          CreateVulkanFfxFrameGenerator(vulkan_device_)) {
+    frame_generators_.push_back(std::move(generator));
+  }
+  if (std::unique_ptr<VulkanFrameGenerator> generator =
+          CreateVulkanDlssFrameGenerator(vulkan_device_)) {
+    frame_generators_.push_back(std::move(generator));
+  }
+  if (std::unique_ptr<VulkanFrameGenerator> generator =
+          CreateVulkanLsfgFrameGenerator(vulkan_device_)) {
+    frame_generators_.push_back(std::move(generator));
+  }
+  for (const std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
+    const FrameGeneratorInfo& info = generator->info();
+    if (info.available) {
+      REXLOG_INFO("VulkanPresenter: frame generator {} ({} {}) available", info.id, info.name,
+                  info.version);
+    } else {
+      REXLOG_INFO("VulkanPresenter: frame generator {} unavailable: {}", info.id,
+                  info.unavailable_reason);
+    }
+  }
+  for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+    const UpscalerInfo& info = upscaler->info();
+    if (info.available) {
+      REXLOG_INFO("VulkanPresenter: upscaler {} ({} {}) available", info.id, info.name,
+                  info.version);
+    } else {
+      REXLOG_INFO("VulkanPresenter: upscaler {} unavailable: {}", info.id,
+                  info.unavailable_reason);
+    }
+  }
+
+  return InitializeCommonSurfaceIndependent();
+}
+
+bool VulkanPresenter::CreateHdrSwapchainImages(VkFormat swapchain_format) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  PaintContext& context = paint_context_;
+
+  // The last pass and its pipeline outlive connections with the same
+  // swapchain format.
+  assert_true(swapchain_format == PaintContext::kHdrFormat ||
+              swapchain_format == PaintContext::kHdrPqFormat);
+  if (context.hdr_render_pass != VK_NULL_HANDLE &&
+      context.hdr_render_pass_format != swapchain_format) {
+    context.submission_tracker.AwaitAllSubmissionsCompletion();
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, context.hdr_pipeline);
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device, context.hdr_render_pass);
+  }
+  if (context.hdr_render_pass == VK_NULL_HANDLE) {
+    VkAttachmentDescription attachment = {};
+    attachment.format = swapchain_format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    // Every pixel is written.
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference color_attachment = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_attachment;
+    VkSubpassDependency dependencies[2] = {};
+    // srcStageMask is the acquire semaphore's wait stage.
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].srcAccessMask = 0;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    VkRenderPassCreateInfo render_pass_create_info = {};
+    render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    render_pass_create_info.attachmentCount = 1;
+    render_pass_create_info.pAttachments = &attachment;
+    render_pass_create_info.subpassCount = 1;
+    render_pass_create_info.pSubpasses = &subpass;
+    render_pass_create_info.dependencyCount = uint32_t(rex::countof(dependencies));
+    render_pass_create_info.pDependencies = dependencies;
+    if (dfn.vkCreateRenderPass(device, &render_pass_create_info, nullptr,
+                               &context.hdr_render_pass) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create the HDR output render pass");
+      return false;
+    }
+    context.hdr_render_pass_format = swapchain_format;
+  }
+  auto create_shader_module = [&](const uint32_t* code, size_t size, VkShaderModule& module) {
+    if (module != VK_NULL_HANDLE) {
+      return true;
+    }
+    VkShaderModuleCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    create_info.codeSize = size;
+    create_info.pCode = code;
+    if (dfn.vkCreateShaderModule(device, &create_info, nullptr, &module) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR output shader module");
+      return false;
+    }
+    return true;
+  };
+  if (!create_shader_module(shaders::hdr_output_ps, sizeof(shaders::hdr_output_ps),
+                            hdr_output_fs_) ||
+      !create_shader_module(shaders::hdr_ui_mask_ps, sizeof(shaders::hdr_ui_mask_ps),
+                            hdr_ui_mask_fs_)) {
+    return false;
+  }
+  if (context.hdr_pipeline == VK_NULL_HANDLE) {
+    context.hdr_pipeline = CreateGuestOutputPaintPipeline(
+        GuestOutputPaintEffect::kBilinear, context.hdr_render_pass, hdr_output_fs_,
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+            VK_COLOR_COMPONENT_A_BIT,
+        guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr]);
+    if (context.hdr_pipeline == VK_NULL_HANDLE) {
+      return false;
+    }
+  }
+  if (context.hdr_ui_mask_pipeline == VK_NULL_HANDLE) {
+    // Compatible with every swapchain_render_pass of an HDR swapchain: the
+    // stand-in format does not change.
+    context.hdr_ui_mask_pipeline =
+        CreateGuestOutputPaintPipeline(GuestOutputPaintEffect::kBilinear,
+                                       context.swapchain_render_pass, hdr_ui_mask_fs_,
+                                       VK_COLOR_COMPONENT_A_BIT);
+    if (context.hdr_ui_mask_pipeline == VK_NULL_HANDLE) {
+      return false;
+    }
+  }
+
+  const uint32_t image_count = uint32_t(context.swapchain_images.size());
+  // The sampler too, though immutable, as for guest_output_descriptor_pool.
+  VkDescriptorPoolSize pool_sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, image_count},
+                                        {VK_DESCRIPTOR_TYPE_SAMPLER, image_count}};
+  VkDescriptorPoolCreateInfo pool_create_info = {};
+  pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_create_info.maxSets = image_count;
+  pool_create_info.poolSizeCount = uint32_t(rex::countof(pool_sizes));
+  pool_create_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
+                                 &context.hdr_descriptor_pool) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the HDR output descriptor pool");
+    return false;
+  }
+
+  context.hdr_images.resize(image_count);
+  for (uint32_t i = 0; i < image_count; ++i) {
+    PaintContext::HdrImage& hdr_image = context.hdr_images[i];
+
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    // Rendered as UNORM like an SDR swapchain image, sampled as sRGB.
+    image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = PaintContext::kHdrStandInFormat;
+    image_create_info.extent = {context.swapchain_extent.width, context.swapchain_extent.height,
+                                1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
+                                              util::MemoryPurpose::kDeviceLocal, hdr_image.image,
+                                              hdr_image.memory)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR output stand-in image");
+      return false;
+    }
+
+    VkImageViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    view_create_info.image = hdr_image.image;
+    view_create_info.format = PaintContext::kHdrStandInSrgbFormat;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &hdr_image.srgb_view) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR output stand-in view");
+      return false;
+    }
+    view_create_info.image = context.swapchain_images[i];
+    view_create_info.format = swapchain_format;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &hdr_image.swapchain_view) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR swapchain image view");
+      return false;
+    }
+
+    VkFramebufferCreateInfo framebuffer_create_info = {};
+    framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_create_info.renderPass = context.hdr_render_pass;
+    framebuffer_create_info.attachmentCount = 1;
+    framebuffer_create_info.pAttachments = &hdr_image.swapchain_view;
+    // The swapchain's own size, rotated from the stand-in's when pre-rotated.
+    const VkExtent2D swapchain_image_extent = HdrSwapchainImageExtent(context.swapchain_extent);
+    framebuffer_create_info.width = swapchain_image_extent.width;
+    framebuffer_create_info.height = swapchain_image_extent.height;
+    framebuffer_create_info.layers = 1;
+    if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
+                                &hdr_image.swapchain_framebuffer) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR swapchain framebuffer");
+      return false;
+    }
+
+    VkDescriptorSetAllocateInfo set_allocate_info = {};
+    set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_allocate_info.descriptorPool = context.hdr_descriptor_pool;
+    set_allocate_info.descriptorSetCount = 1;
+    set_allocate_info.pSetLayouts = &guest_output_paint_image_descriptor_set_layout_;
+    if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info, &hdr_image.descriptor_set) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to allocate an HDR output descriptor set");
+      return false;
+    }
+    VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, hdr_image.srgb_view,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = hdr_image.descriptor_set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image_info;
+    dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+  }
+  return true;
+}
+
+VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(
+    GuestOutputPaintEffect effect, VkRenderPass render_pass, VkShaderModule fragment_shader,
+    VkColorComponentFlags color_write_mask, VkPipelineLayout layout) {
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    VkPipelineShaderStageCreateInfo& stage = stages[i];
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+    stage.pName = "main";
+  }
+  stages[0].module = guest_output_paint_vs_;
+  stages[1].module =
+      fragment_shader != VK_NULL_HANDLE ? fragment_shader : guest_output_paint_fs_[size_t(effect)];
+  assert_true(stages[1].module != VK_NULL_HANDLE);
+
+  VkPipelineVertexInputStateCreateInfo vertex_input_state = {};
+  vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+  VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
+  input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+  VkPipelineViewportStateCreateInfo viewport_state = {};
+  viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  viewport_state.viewportCount = 1;
+  viewport_state.scissorCount = 1;
+
+  VkPipelineRasterizationStateCreateInfo rasterization_state = {};
+  rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+  rasterization_state.cullMode = VK_CULL_MODE_NONE;
+  rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rasterization_state.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo multisample_state = {};
+  multisample_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState color_blend_attachment_state = {};
+  color_blend_attachment_state.colorWriteMask = color_write_mask;
+  VkPipelineColorBlendStateCreateInfo color_blend_state = {};
+  color_blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  color_blend_state.attachmentCount = 1;
+  color_blend_state.pAttachments = &color_blend_attachment_state;
+
+  static const VkDynamicState kPipelineDynamicStates[] = {
+      VK_DYNAMIC_STATE_VIEWPORT,
+      VK_DYNAMIC_STATE_SCISSOR,
+  };
+  VkPipelineDynamicStateCreateInfo dynamic_state = {};
+  dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dynamic_state.dynamicStateCount = uint32_t(rex::countof(kPipelineDynamicStates));
+  dynamic_state.pDynamicStates = kPipelineDynamicStates;
+
+  VkGraphicsPipelineCreateInfo pipeline_create_info;
+  pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipeline_create_info.pNext = nullptr;
+  pipeline_create_info.flags = 0;
+  pipeline_create_info.stageCount = uint32_t(rex::countof(stages));
+  pipeline_create_info.pStages = stages;
+  pipeline_create_info.pVertexInputState = &vertex_input_state;
+  pipeline_create_info.pInputAssemblyState = &input_assembly_state;
+  pipeline_create_info.pTessellationState = nullptr;
+  pipeline_create_info.pViewportState = &viewport_state;
+  pipeline_create_info.pRasterizationState = &rasterization_state;
+  pipeline_create_info.pMultisampleState = &multisample_state;
+  pipeline_create_info.pDepthStencilState = nullptr;
+  pipeline_create_info.pColorBlendState = &color_blend_state;
+  pipeline_create_info.pDynamicState = &dynamic_state;
+  pipeline_create_info.layout =
+      layout != VK_NULL_HANDLE
+          ? layout
+          : guest_output_paint_pipeline_layouts_[GetGuestOutputPaintPipelineLayoutIndex(effect)];
+  pipeline_create_info.renderPass = render_pass;
+  pipeline_create_info.subpass = 0;
+  pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
+  pipeline_create_info.basePipelineIndex = -1;
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  VkPipeline pipeline;
+  if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+                                    &pipeline) != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create the guest output painting pipeline "
+        "for effect {}",
+        size_t(effect));
+    return VK_NULL_HANDLE;
+  }
+  return pipeline;
+}
+
+}  // namespace vulkan
+}  // namespace ui
+}  // namespace rex

@@ -390,7 +390,7 @@ void SettingsPages::Save() {
 std::unique_ptr<MenuScreen> SettingsPages::Display() {
   std::vector<MenuRow> rows;
   // An Android activity is always full screen on its one display.
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   rows.push_back(Toggle("FULLSCREEN", "fullscreen"));
   rows.push_back(Setting("MONITOR",
                          {{"DEFAULT", {{"monitor", "0"}}},
@@ -573,7 +573,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Display() {
   // most half the refresh (UP-4.2), so a 60 Hz display shows 30 real frames
   // and 30 generated ones. Offered only where it has run (Windows, Linux and
   // the Steam Deck); elsewhere present_frame_generation still takes it.
-#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__) && !REX_PLATFORM_IOS)
   const bool frame_generation_tested = true;
 #else
   const bool frame_generation_tested = false;
@@ -722,7 +722,7 @@ std::unique_ptr<MenuScreen> SettingsPages::HdrCalibration() {
       case 2:
         return std::string("THE WHITE SQUARE SHOULD LOOK LIKE WHITE PAPER");
       default:
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || REX_PLATFORM_IOS
         return std::string("RAISE UNTIL SQUARE DISAPPEARS; IF IT STAYS VISIBLE, KEEP YOUR PEAK");
 #else
         return std::string("RAISE THE PEAK UNTIL THE SQUARE DISAPPEARS");
@@ -740,7 +740,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Graphics() {
   std::vector<MenuRow> rows;
   // PB-5: whole setups at once; any other combination reads CUSTOM. All
   // render on Vulkan with the split GPU commands thread.
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || REX_PLATFORM_IOS
   // AP-7.5: a handheld renders at 1x (AP-2.5) and trades frame rate for
   // battery and heat. QUALITY 30 is the Xbox 360's own rate (the guest
   // vblank at 60 Hz) with the game's 4x MSAA and shadows; SMOOTH 60 doubles
@@ -833,6 +833,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Graphics() {
   // for the GPU (Mesa Turnip Gen8 V37, bundled, on Adreno 7xx), SYSTEM the
   // device's own, and every package under state/drivers (bundled or
   // imported) by its folder name.
+#if defined(__ANDROID__)
   {
     std::vector<Choice> drivers = {{"AUTO", {{"android_gpu_driver", "\"auto\""}}},
                                    {"SYSTEM", {{"android_gpu_driver", "\"\""}}}};
@@ -858,6 +859,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Graphics() {
     import.activate = [] { rex::ui::vulkan::CallAndroidActivityMethod("importGpuDriver"); };
     rows.push_back(std::move(import));
   }
+#endif
 #else
   // LOW-SPEC 60 and BALANCED 40 (LS-1.1, LS-1.6) choose the cheapest
   // workload on purpose for weaker machines: the console's own resolution,
@@ -1001,7 +1003,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Graphics() {
   std::vector<Choice> scales;
   // Android renders at 1x: higher scales need resolve buffers a phone's
   // shared memory cannot hold (AP-2.5).
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || REX_PLATFORM_IOS
   constexpr int kMaxScale = 1;
 #else
   constexpr int kMaxScale = 4;
@@ -2107,7 +2109,7 @@ std::unique_ptr<MenuScreen> SettingsPages::Controls() {
   rows.push_back(std::move(map));
   rows.push_back(Page("RACING WHEEL", &SettingsPages::Wheel));
   // OpenTrack runs on the same PC, so not on Android.
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   rows.push_back(Page("HEAD TRACKING", &SettingsPages::HeadTracking));
 #endif
   // Always listed so players can find it; the page greys its options out while no

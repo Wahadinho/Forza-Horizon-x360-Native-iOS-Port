@@ -1,0 +1,384 @@
+#include <rex/input/sdl/joystick_mapping.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+#include <SDL3/SDL.h>
+
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/input/dualsense.h>
+#include <rex/input/flags.h>
+#include <rex/logging.h>
+
+REXCVAR_DEFINE_STRING(hid_user_mappings_file, "", "Input",
+                      "SDL gamepad mappings the player made (the mapping assistant), loaded after "
+                      "hid_mappings_file so they win; empty turns them off");
+
+namespace rex::input::sdl {
+
+namespace {
+
+// An axis counts as moved past half its travel from rest, and as back at
+// rest within a quarter.
+constexpr int kMoved = 16384;
+constexpr int kRested = 8192;
+// A wheel's steering: moved past an eighth (about 110 degrees each way on a
+// 900-degree wheel), back at rest within a sixteenth.
+constexpr int kWheelMoved = 4096;
+constexpr int kWheelRested = 2048;
+// How long after Begin an axis's first real report can still arrive (see
+// SampleRest).
+constexpr uint64_t kSettleNs = 1'000'000'000;
+
+// Exactly at an end of the axis range, where triggers and pedals rest; a
+// centred stick at rest never reads there.
+bool AtEnd(int value) {
+  return value >= 32767 || value <= -32767;
+}
+
+std::string GuidString(SDL_GUID guid) {
+  char text[64] = {};
+  SDL_GUIDToString(guid, text, int(sizeof(text)));
+  return text;
+}
+
+std::vector<std::string> ReadLines(const std::filesystem::path& path) {
+  std::vector<std::string> lines;
+  std::ifstream input(path, std::ios::binary);
+  for (std::string line; std::getline(input, line);) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty()) lines.push_back(std::move(line));
+  }
+  return lines;
+}
+
+bool WriteLines(const std::filesystem::path& path, const std::vector<std::string>& lines) {
+  std::error_code error;
+  if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), error);
+  const std::filesystem::path temporary = std::filesystem::path(path) += ".tmp";
+  {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    for (const auto& line : lines) output << line << '\n';
+    if (!output) return false;
+  }
+  std::filesystem::rename(temporary, path, error);
+  return !error;
+}
+
+bool SameGuid(std::string_view line, std::string_view guid) {
+  return line.size() > guid.size() && line.substr(0, guid.size()) == guid &&
+         line[guid.size()] == ',';
+}
+
+}  // namespace
+
+std::vector<JoystickInfo> ListJoysticks() {
+  std::vector<JoystickInfo> joysticks;
+  int count = 0;
+  SDL_JoystickID* ids = SDL_GetJoysticks(&count);
+  if (!ids) return joysticks;
+  for (int i = 0; i < count; ++i) {
+    JoystickInfo info;
+    info.instance_id = uint32_t(ids[i]);
+    const char* name = SDL_GetJoystickNameForID(ids[i]);
+    info.name = name ? name : "Controller";
+    info.guid = GuidString(SDL_GetJoystickGUIDForID(ids[i]));
+    info.wheel_type = SDL_GetJoystickTypeForID(ids[i]) == SDL_JOYSTICK_TYPE_WHEEL;
+    const SDL_GamepadType type = SDL_GetGamepadTypeForID(ids[i]);
+    info.playstation = type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 ||
+                       type == SDL_GAMEPAD_TYPE_PS5;
+    info.steam_virtual = info.name == "Steam Virtual Gamepad";
+    if (SDL_Joystick* open = SDL_GetJoystickFromID(ids[i])) {
+      if (SDL_Gamepad* gamepad = SDL_GetGamepadFromID(ids[i])) {
+        info.steam_virtual |= SDL_GetGamepadSteamHandle(gamepad) != 0;
+      }
+      const auto connection = SDL_GetJoystickConnectionState(open);
+      info.wireless = connection == SDL_JOYSTICK_CONNECTION_WIRELESS;
+    }
+    info.dualsense = !info.steam_virtual &&
+                     rex::input::dualsense::IsDualSense(SDL_GetJoystickVendorForID(ids[i]),
+                                                        SDL_GetJoystickProductForID(ids[i]));
+    if (char* mapping = SDL_GetGamepadMappingForID(ids[i])) {
+      info.mapping = mapping;
+      SDL_free(mapping);
+    }
+    const std::string user_path = REXCVAR_GET(hid_user_mappings_file);
+    if (!user_path.empty()) {
+      const auto lines = ReadLines(rex::to_path(user_path));
+      info.user_mapping = std::any_of(lines.begin(), lines.end(), [&](const std::string& line) {
+        return SameGuid(line, info.guid);
+      });
+    }
+    joysticks.push_back(std::move(info));
+  }
+  SDL_free(ids);
+  return joysticks;
+}
+
+bool JoystickCapture::Begin(uint32_t instance_id) {
+  End();
+  joystick_ = SDL_OpenJoystick(SDL_JoystickID(instance_id));
+  if (!joystick_) {
+    REXLOG_WARN("Controller mapping: cannot open joystick {}: {}", instance_id, SDL_GetError());
+    return false;
+  }
+  wheel_ = SDL_GetJoystickType(joystick_) == SDL_JOYSTICK_TYPE_WHEEL;
+  begin_ns_ = SDL_GetTicksNS();
+  SDL_UpdateJoysticks();
+  SampleRest();
+  waiting_for_rest_ = true;
+  return true;
+}
+
+void JoystickCapture::End() {
+  if (joystick_) {
+    SDL_CloseJoystick(joystick_);
+    joystick_ = nullptr;
+  }
+}
+
+void JoystickCapture::SampleRest() {
+  // Where each axis rests: centred sticks near 0, triggers at an end. SDL's
+  // initial state is preferred, since a control may be held when capture
+  // begins. But SDL keeps the first value an axis reports as its initial
+  // state, and some DirectInput wheels (a Thrustmaster T248 on Windows)
+  // report every axis as 0 when opened and their real positions about half
+  // a second later, so pedals resting at the top keep an initial state of 0.
+  // An axis exactly at an end with an initial state of 0 is such a pedal.
+  const int axes = SDL_GetNumJoystickAxes(joystick_);
+  rest_axes_.assign(size_t(std::max(axes, 0)), 0);
+  for (int i = 0; i < axes; ++i) {
+    int16_t value = SDL_GetJoystickAxis(joystick_, i);
+    int16_t start = 0;
+    if (SDL_GetJoystickAxisInitialState(joystick_, i, &start) && !(start == 0 && AtEnd(value))) {
+      value = start;
+    }
+    rest_axes_[size_t(i)] = std::abs(value) > kMoved ? (value < 0 ? -32768 : 32767) : 0;
+  }
+}
+
+void JoystickCapture::SettleRest() {
+  // The same wheels' real positions can arrive after Begin: an axis taken as
+  // centred that reaches an end within kSettleNs is a pedal reporting late,
+  // not a player who read the prompt and pushed a stick fully in that time.
+  if (SDL_GetTicksNS() - begin_ns_ > kSettleNs)
+    return;
+  for (size_t i = 0; i < rest_axes_.size(); ++i) {
+    const int value = SDL_GetJoystickAxis(joystick_, int(i));
+    if (rest_axes_[i] == 0 && AtEnd(value)) {
+      rest_axes_[i] = value < 0 ? -32768 : 32767;
+    }
+  }
+}
+
+int JoystickCapture::MovedThreshold(size_t axis) const {
+  return wheel_ && rest_axes_[axis] == 0 ? kWheelMoved : kMoved;
+}
+
+int JoystickCapture::RestedThreshold(size_t axis) const {
+  return wheel_ && rest_axes_[axis] == 0 ? kWheelRested : kRested;
+}
+
+bool JoystickCapture::AtRest() const {
+  for (int i = 0, n = SDL_GetNumJoystickButtons(joystick_); i < n; ++i) {
+    if (SDL_GetJoystickButton(joystick_, i)) return false;
+  }
+  for (int i = 0, n = SDL_GetNumJoystickHats(joystick_); i < n; ++i) {
+    if (SDL_GetJoystickHat(joystick_, i) != SDL_HAT_CENTERED) return false;
+  }
+  for (size_t i = 0; i < rest_axes_.size(); ++i) {
+    if (std::abs(int(SDL_GetJoystickAxis(joystick_, int(i))) - rest_axes_[i]) >
+        RestedThreshold(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<std::string> JoystickCapture::Poll() {
+  if (!joystick_) return std::nullopt;
+  SDL_UpdateJoysticks();
+  SettleRest();
+  if (waiting_for_rest_) {
+    if (!AtRest()) return std::nullopt;
+    waiting_for_rest_ = false;
+  }
+  std::optional<std::string> input;
+  for (int i = 0, n = SDL_GetNumJoystickButtons(joystick_); i < n && !input; ++i) {
+    if (SDL_GetJoystickButton(joystick_, i)) input = "b" + std::to_string(i);
+  }
+  for (int i = 0, n = SDL_GetNumJoystickHats(joystick_); i < n && !input; ++i) {
+    const uint8_t hat = SDL_GetJoystickHat(joystick_, i);
+    // One direction at a time; a diagonal waits for the player to settle.
+    if (hat == SDL_HAT_UP || hat == SDL_HAT_RIGHT || hat == SDL_HAT_DOWN || hat == SDL_HAT_LEFT) {
+      input = "h" + std::to_string(i) + "." + std::to_string(hat);
+    }
+  }
+  for (size_t i = 0; i < rest_axes_.size() && !input; ++i) {
+    const int value = SDL_GetJoystickAxis(joystick_, int(i));
+    const int rest = rest_axes_[i];
+    if (std::abs(value - rest) <= MovedThreshold(i))
+      continue;
+    const std::string axis = "a" + std::to_string(i);
+    if (rest == 0) {
+      input = (value < 0 ? "-" : "+") + axis;
+    } else {
+      // A trigger: its whole travel, inverted when it rests at the top.
+      input = rest < 0 ? axis : axis + "~";
+    }
+  }
+  if (input) waiting_for_rest_ = true;
+  return input;
+}
+
+std::string BuildMapping(const JoystickInfo& joystick,
+                         const std::vector<std::pair<std::string, std::string>>& bindings) {
+  std::string name = joystick.name;
+  for (char& c : name) {
+    if (c == ',') c = ' ';
+  }
+  std::string mapping = joystick.guid + "," + name + ",";
+  for (const auto& [output, input] : bindings) {
+    mapping += output + ":" + input + ",";
+  }
+  // SDL_AddGamepadMappingsFromFile skips lines without one.
+  mapping += std::string("platform:") + SDL_GetPlatform() + ",";
+  return mapping;
+}
+
+bool ApplyMapping(std::string_view mapping) {
+  const std::string text(mapping);
+  if (SDL_AddGamepadMapping(text.c_str()) < 0) {
+    REXLOG_ERROR("Controller mapping: SDL rejected '{}': {}", text, SDL_GetError());
+    return false;
+  }
+  REXLOG_INFO("Controller mapping: applied '{}'", text);
+  return true;
+}
+
+bool SaveMapping(std::string_view mapping) {
+  if (!ApplyMapping(mapping)) return false;
+  const std::string text(mapping);
+  const std::string path = REXCVAR_GET(hid_user_mappings_file);
+  if (path.empty()) return true;
+  const std::string_view guid = mapping.substr(0, mapping.find(','));
+  // The cvar is UTF-8, as SDL reads it.
+  std::vector<std::string> lines = ReadLines(rex::to_path(path));
+  std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
+  lines.push_back(text);
+  return WriteLines(rex::to_path(path), lines);
+}
+
+int LoadUserMappings(std::string_view path) {
+  if (path.empty()) return 0;
+  const std::string platform = std::string("platform:") + SDL_GetPlatform() + ",";
+  int loaded = 0;
+  for (const auto& line : ReadLines(rex::to_path(std::string(path)))) {
+    if (line.empty() || line.front() == '#') continue;
+    if (line.find("platform:") != std::string::npos &&
+        (line + ",").find(platform) == std::string::npos) {
+      continue;
+    }
+    if (SDL_AddGamepadMapping(line.c_str()) >= 0) {
+      ++loaded;
+    } else {
+      REXLOG_WARN("Controller mapping: SDL rejected saved '{}': {}", line, SDL_GetError());
+    }
+  }
+  return loaded;
+}
+
+bool RemoveUserMapping(std::string_view guid) {
+  const std::string path = REXCVAR_GET(hid_user_mappings_file);
+  if (!path.empty()) {
+    std::vector<std::string> lines = ReadLines(rex::to_path(path));
+    std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
+    WriteLines(rex::to_path(path), lines);
+  }
+  // The database line for this platform (or for every platform).
+  const std::string platform = std::string("platform:") + SDL_GetPlatform() + ",";
+  for (const auto& line : ReadLines(REXCVAR_GET(hid_mappings_file))) {
+    if (SameGuid(line, guid) && (line.find("platform:") == std::string::npos ||
+                                 (line + ",").find(platform) != std::string::npos)) {
+      return ApplyMapping(line);
+    }
+  }
+  return false;
+}
+
+bool VirtualJoystick::Attach(const char* name, int axes, int buttons, int hats, bool wheel) {
+  Detach();
+  initialized_ = SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
+  SDL_VirtualJoystickDesc desc;
+  SDL_INIT_INTERFACE(&desc);
+  desc.type = wheel ? SDL_JOYSTICK_TYPE_WHEEL : SDL_JOYSTICK_TYPE_UNKNOWN;
+  desc.naxes = uint16_t(axes);
+  desc.nbuttons = uint16_t(buttons);
+  desc.nhats = uint16_t(hats);
+  desc.name = name;
+  id_ = uint32_t(SDL_AttachVirtualJoystick(&desc));
+  joystick_ = id_ ? SDL_OpenJoystick(SDL_JoystickID(id_)) : nullptr;
+  return joystick_ != nullptr;
+}
+
+void VirtualJoystick::Detach() {
+  if (joystick_) SDL_CloseJoystick(joystick_);
+  if (id_) SDL_DetachVirtualJoystick(SDL_JoystickID(id_));
+  if (initialized_) SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
+  joystick_ = nullptr;
+  id_ = 0;
+  initialized_ = false;
+}
+
+void VirtualJoystick::SetButton(int button, bool down) {
+  if (joystick_) SDL_SetJoystickVirtualButton(joystick_, button, down);
+}
+
+void VirtualJoystick::SetAxis(int axis, int16_t value) {
+  if (joystick_) SDL_SetJoystickVirtualAxis(joystick_, axis, value);
+}
+
+void VirtualJoystick::SetHat(int hat, uint8_t value) {
+  if (joystick_) SDL_SetJoystickVirtualHat(joystick_, hat, value);
+}
+
+bool GamepadView::Begin(uint32_t instance_id) {
+  End();
+  gamepad_ = SDL_OpenGamepad(SDL_JoystickID(instance_id));
+  return gamepad_ != nullptr;
+}
+
+void GamepadView::End() {
+  if (gamepad_) {
+    SDL_CloseGamepad(gamepad_);
+    gamepad_ = nullptr;
+  }
+}
+
+std::vector<std::string> GamepadView::Held() {
+  std::vector<std::string> held;
+  if (!gamepad_) return held;
+  SDL_UpdateGamepads();
+  for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
+    const auto button = SDL_GamepadButton(i);
+    if (SDL_GetGamepadButton(gamepad_, button)) {
+      if (const char* name = SDL_GetGamepadStringForButton(button)) held.emplace_back(name);
+    }
+  }
+  for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; ++i) {
+    const auto axis = SDL_GamepadAxis(i);
+    const int value = SDL_GetGamepadAxis(gamepad_, axis);
+    const char* name = SDL_GetGamepadStringForAxis(axis);
+    if (!name || std::abs(value) <= kMoved) continue;
+    const bool trigger =
+        axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+    held.push_back(trigger ? std::string(name) : (value < 0 ? "-" : "+") + std::string(name));
+  }
+  return held;
+}
+
+}  // namespace rex::input::sdl

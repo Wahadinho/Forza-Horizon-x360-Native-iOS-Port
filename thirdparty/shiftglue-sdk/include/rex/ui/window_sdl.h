@@ -1,0 +1,111 @@
+/**
+ * @file        ui/window_sdl.h
+ * @brief       SDL3 implementation of the Window abstraction
+ *
+ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
+ * @remarks     Derived from Xenia's window_win.cc (Ben Vanik, 2020).
+ */
+
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string_view>
+
+#include <SDL3/SDL.h>
+
+#include <rex/ui/window.h>
+#include <rex/ui/windowed_app_context_sdl.h>
+
+namespace rex::ui {
+
+// The window's size in the pixels the renderer draws, and how many of them
+// span one SDL window coordinate. On a high-density (Retina) display these
+// are the backing pixels, unless window_max_pixel_density caps them: the
+// drawable is then smaller and the system scales it up to the window.
+bool GetSdlWindowSizeInRenderPixels(SDL_Window* window, int* width, int* height);
+float GetSdlWindowRenderDensity(SDL_Window* window);
+
+class WindowSDL final : public Window {
+ public:
+  // The default size is the app's own, used where the cvars ask for none.
+  WindowSDL(WindowedAppContext& app_context, const std::string_view title,
+            uint32_t desired_logical_width, uint32_t desired_logical_height,
+            uint32_t default_logical_width, uint32_t default_logical_height);
+  ~WindowSDL() override;
+
+  void* GetNativeWindowHandle() const override;
+  SafeAreaInsets GetSafeAreaInsets() const override;
+  void ApplyConfiguredSizeAndMonitor() override;
+  bool SetRelativeMouseMode(bool enable) override;
+  bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
+
+  // Called by SDLWindowedAppContext on the UI thread.
+  void HandleWindowEvent(SDL_Event& event);
+  void HandleKeyEvent(SDL_Event& event);
+  void HandleTextInputEvent(SDL_Event& event);
+  void HandleMouseEvent(SDL_Event& event);
+  void HandleDropEvent(SDL_Event& event);
+  // Touch screen fingers, in physical pixels (AP-4.2); SDL also turns them
+  // into mouse events, which the menus use.
+  void HandleFingerEvent(SDL_Event& event);
+  void HandlePaintEvent();
+  // The platform destroys the native window behind the surface when the
+  // app goes to the background and makes a new one on its return.
+  void HandleAppBackground(bool background);
+
+ protected:
+  uint32_t GetLatestDpiImpl() const override;
+
+  bool OpenImpl() override;
+  void RequestCloseImpl() override;
+
+  void ApplyNewFullscreen() override;
+  void ApplyNewTitle() override;
+  void ApplyNewMouseCapture() override;
+  void ApplyNewMouseRelease() override;
+  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
+  void ApplyNewTextInputActive() override;
+  void FocusImpl() override;
+
+  std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
+  void RequestPaintImpl() override;
+
+ private:
+  SDLWindowedAppContext& sdl_app_context() const {
+    return static_cast<SDLWindowedAppContext&>(app_context());
+  }
+
+  // Performs the common close choreography (OnBeforeClose, native destroy,
+  // OnAfterClose). Used by both RequestCloseImpl and the close-requested
+  // event handler.
+  void PerformClose();
+  void DestroySDLWindow();
+
+  void ApplyCursorVisibilityNow();
+  void ApplyTextInputActiveNow();
+  void RearmCursorAutoHideTimer();
+
+  // Ratio between SDL window coordinates and the physical pixels listeners
+  // expect. Never zero.
+  float GetPixelDensity() const;
+
+  // Centers the window on the display the monitor cvar names, if any.
+  void MoveToConfiguredMonitor();
+
+  uint32_t default_logical_width_;
+  uint32_t default_logical_height_;
+  SDL_Window* sdl_window_ = nullptr;
+  SDL_WindowID sdl_window_id_ = 0;
+  std::atomic<bool> paint_pending_{false};
+  // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
+  SDL_TimerID cursor_hide_timer_ = 0;
+};
+
+}  // namespace rex::ui

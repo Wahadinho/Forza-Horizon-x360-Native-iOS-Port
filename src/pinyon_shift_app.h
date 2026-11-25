@@ -82,7 +82,7 @@ class PinyonShiftApp final : public rex::ReXApp {
   // Creates the host UI and installs its XAM dialogs once presentation is
   // ready; UI thread.
   bool EnsureHostUi();
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   void ToggleFrameInspector();
   std::unique_ptr<pinyon_shift::ui::FrameInspector> frame_inspector_;
 #endif

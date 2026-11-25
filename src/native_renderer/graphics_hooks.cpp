@@ -33,7 +33,7 @@ REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_gpu_corpus, false, "Pinyon Shift",
                     "Sample native GPU pass and texture-request timings every 60 frames "
                     "(read by the D3D12 command processor)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_DOUBLE(pinyon_shift_fh1_env_map_rate, REX_PLATFORM_ANDROID ? 0.25 : 1.0,
+REXCVAR_DEFINE_DOUBLE(pinyon_shift_fh1_env_map_rate, (REX_PLATFORM_ANDROID || REX_PLATFORM_IOS) ? 0.25 : 1.0,
                       "Pinyon Shift",
                       "Scales how often the dynamic cubemap that cars reflect is redrawn "
                       "(the render scenarios' EnvMapFrequencyScale; 1: the game's rate, 0: "
@@ -47,7 +47,7 @@ REXCVAR_DEFINE_STRING(pinyon_shift_fh1_scene_size, "", "Pinyon Shift",
                       "steps of 45) by scaling the title's tiling bands; the presenter scales "
                       "the frame up. The exposure and glare chain still differs from 720p")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_shadows, !REX_PLATFORM_ANDROID, "Pinyon Shift",
+REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_shadows, !(REX_PLATFORM_ANDROID || REX_PLATFORM_IOS), "Pinyon Shift",
                     "Draw the sun's shadows. Off sets the render scenarios' "
                     "SkipShadowMapUnlessCockpit (no shadow maps, depth pre-pass or shadow "
                     "mask: about 6.4 ms a frame on the Odin 2 Portal) and keeps the "

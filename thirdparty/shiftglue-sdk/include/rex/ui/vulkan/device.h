@@ -1,0 +1,415 @@
+#pragma once
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2025 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include <rex/ui/vulkan/instance.h>
+
+namespace rex {
+namespace ui {
+namespace vulkan {
+
+class VulkanDevice {
+ public:
+  static std::unique_ptr<VulkanDevice> CreateIfSupported(const VulkanInstance* vulkan_instance,
+                                                         VkPhysicalDevice physical_device,
+                                                         bool with_gpu_emulation,
+                                                         bool with_swapchain);
+
+  VulkanDevice(const VulkanDevice&) = delete;
+  VulkanDevice& operator=(const VulkanDevice&) = delete;
+  VulkanDevice(VulkanDevice&&) = delete;
+  VulkanDevice& operator=(VulkanDevice&&) = delete;
+
+  ~VulkanDevice();
+
+  const VulkanInstance* vulkan_instance() const { return vulkan_instance_; }
+
+  VkPhysicalDevice physical_device() const { return physical_device_; }
+
+  // If functionality from higher API versions is used, increase this.
+  // This is for VkApplicationInfo.
+  // "apiVersion must be the highest version of Vulkan that the application is
+  // designed to use"
+  // "The patch version number specified in apiVersion is ignored when creating
+  // an instance object"
+  static constexpr uint32_t kHighestUsedApiMinorVersion = VK_MAKE_API_VERSION(0, 1, 3, 0);
+
+  struct Properties {
+    // Vulkan 1.0
+    uint32_t apiVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
+    uint32_t driverVersion = 0;
+    uint32_t vendorID = 0;
+    uint32_t deviceID = 0;
+    char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
+
+    uint32_t maxImageDimension2D = 4096;
+    uint32_t maxImageDimension3D = 256;
+    uint32_t maxImageDimensionCube = 4096;
+    uint32_t maxImageArrayLayers = 256;
+    uint32_t maxTexelBufferElements = 65536;
+    uint32_t maxStorageBufferRange = uint32_t(1) << 27;
+    uint32_t maxSamplerAllocationCount = 4000;
+    uint32_t maxPerStageDescriptorSamplers = 16;
+    uint32_t maxPerStageDescriptorStorageBuffers = 4;
+    uint32_t maxPerStageDescriptorSampledImages = 16;
+    uint32_t maxPerStageResources = 128;
+    uint32_t maxVertexOutputComponents = 64;
+    uint32_t maxTessellationEvaluationOutputComponents = 64;
+    uint32_t maxGeometryInputComponents = 64;
+    uint32_t maxGeometryOutputComponents = 64;
+    uint32_t maxFragmentInputComponents = 64;
+    uint32_t maxFragmentCombinedOutputResources = 4;
+    float maxSamplerAnisotropy = 1.0f;
+    float maxSamplerLodBias = 2.0f;
+    // Nanoseconds per timestamp tick.
+    float timestampPeriod = 1.0f;
+    uint32_t maxViewportDimensions[2] = {4096, 4096};
+    VkDeviceSize minUniformBufferOffsetAlignment = 256;
+    VkDeviceSize minStorageBufferOffsetAlignment = 256;
+    uint32_t maxFramebufferWidth = 4096;
+    uint32_t maxFramebufferHeight = 4096;
+    VkSampleCountFlags framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags framebufferStencilSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags framebufferNoAttachmentsSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags sampledImageColorSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    VkSampleCountFlags sampledImageDepthSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlags sampledImageStencilSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    bool standardSampleLocations = false;
+    VkDeviceSize optimalBufferCopyOffsetAlignment = 1;
+    VkDeviceSize optimalBufferCopyRowPitchAlignment = 1;
+    VkDeviceSize nonCoherentAtomSize = 256;
+
+    bool robustBufferAccess = false;
+    bool timelineSemaphore = false;
+    bool fullDrawIndexUint32 = false;
+    bool independentBlend = false;
+    bool geometryShader = false;
+    bool tessellationShader = false;
+    bool sampleRateShading = false;
+
+    // Vulkan 1.1 subgroups: quad operations in fragment shaders.
+
+    bool subgroupQuadFragment = false;
+    bool depthClamp = false;
+    bool fillModeNonSolid = false;
+    bool samplerAnisotropy = false;
+    bool occlusionQueryPrecise = false;
+    bool vertexPipelineStoresAndAtomics = false;
+    bool fragmentStoresAndAtomics = false;
+    bool shaderStorageImageReadWithoutFormat = false;
+    bool shaderStorageImageWriteWithoutFormat = false;
+    bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
+    bool sparseBinding = false;
+    bool sparseResidencyBuffer = false;
+
+    // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
+
+    bool samplerMirrorClampToEdge = false;
+
+    // VK_KHR_uniform_buffer_standard_layout (#253, promoted to 1.2)
+
+    bool uniformBufferStandardLayout = false;
+
+    // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
+
+    bool scalarBlockLayout = false;
+
+    // VK_KHR_vulkan_memory_model (#212, promoted to 1.2)
+
+    bool vulkanMemoryModel = false;
+
+    // VK_KHR_portability_subset (#164)
+
+    bool constantAlphaColorBlendFactors = false;
+    bool imageViewFormatReinterpretation = false;
+    bool imageViewFormatSwizzle = false;
+    bool pointPolygons = false;
+    bool separateStencilMaskRef = false;
+    bool shaderSampleRateInterpolationFunctions = false;
+
+    // VK_KHR_driver_properties (#197, promoted to 1.2)
+
+    VkDriverId driverID = VkDriverId(0);
+
+    // VK_KHR_shader_float_controls (#198, promoted to 1.2)
+
+    bool shaderSignedZeroInfNanPreserveFloat32 = false;
+    bool shaderDenormFlushToZeroFloat32 = false;
+    bool shaderRoundingModeRTEFloat32 = false;
+
+    // VK_EXT_fragment_shader_interlock (#252)
+
+    bool fragmentShaderSampleInterlock = false;
+    bool fragmentShaderPixelInterlock = false;
+
+    // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
+
+    bool shaderDemoteToHelperInvocation = false;
+
+    // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+
+    bool dynamicRendering = false;
+
+    // VK_EXT_non_seamless_cube_map (#423)
+
+    bool nonSeamlessCubeMap = false;
+
+    // VK_EXT_custom_border_color
+
+    bool customBorderColors = false;
+    bool customBorderColorWithoutFormat = false;
+    uint32_t maxCustomBorderColorSamplers = 0;
+
+    // VK_EXT_robustness2
+
+    bool nullDescriptor = false;
+
+    // VK_KHR_present_id (#295) and VK_KHR_present_wait (#249)
+
+    bool presentId = false;
+    bool presentWait = false;
+
+    // VK_KHR_pipeline_executable_properties (#270), only with
+    // vulkan_pipeline_statistics.
+
+    bool pipelineExecutableInfo = false;
+
+    // VK_KHR_fragment_shading_rate (#227), only the pipeline (and dynamic)
+    // rate, with vulkan_fragment_shading_rate.
+
+    bool pipelineFragmentShadingRate = false;
+    // VK_EXT_image_compression_control (vulkan_image_compression_report).
+    bool imageCompressionControl = false;
+
+    // Descriptor indexing (promoted to 1.2), for bindless textures
+    // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
+
+    bool shaderSampledImageArrayDynamicIndexing = false;
+    bool runtimeDescriptorArray = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingUpdateUnusedWhilePending = false;
+    uint32_t maxDescriptorSetUpdateAfterBindSampledImages = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSamplers = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
+    // Vulkan 1.1 (maintenance3): descriptors one set layout may hold in all;
+    // 0 when not reported (1.0 devices).
+    uint32_t maxPerSetDescriptors = 0;
+  };
+
+  // Properties of the core API and enabled extensions, and enabled features.
+  // Some supported functionality is enabled conditionally based on the
+  // `with_swapchain` and `with_gpu_emulation` options.
+  const Properties& properties() const { return properties_; }
+
+  // Enabled extensions not fully covered by the device properties and optional
+  // feature flags in the `Properties` structure (primarily those adding API
+  // functionality rather than GPU features). Also set to true if the version of
+  // the Vulkan API they were promoted to it supported (with the
+  // `ext_major_minor_` prefix rather than `ext_`).
+  struct Extensions {
+    bool ext_KHR_swapchain = false;                     // #2
+    bool ext_1_1_KHR_dedicated_allocation = false;      // #128
+    bool ext_KHR_push_descriptor = false;               // #81
+    bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
+    bool ext_1_2_KHR_image_format_list = false;         // #148
+    // Has optional features not implied by this being true.
+    bool ext_1_1_KHR_sampler_ycbcr_conversion = false;  // #157
+    bool ext_1_1_KHR_bind_memory2 = false;              // #158
+    bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
+    bool ext_EXT_memory_budget = false;                 // #238
+    // Has optional features not implied by this being true.
+    bool ext_EXT_custom_border_color = false;
+    // Has optional features not implied by this being true.
+    bool ext_EXT_robustness2 = false;
+    // Has optional features not implied by this being true.
+    bool ext_1_3_KHR_maintenance4 = false;  // #414
+    // Has optional features not implied by this being true.
+    bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    // Only with vulkan_diagnostic_checkpoints.
+    bool ext_NV_device_diagnostic_checkpoints = false;  // #207
+    // Have optional features not implied by these being true.
+    bool ext_KHR_present_id = false;    // #295
+    bool ext_KHR_present_wait = false;  // #249
+    // The mastering levels of an HDR10 swapchain.
+    bool ext_EXT_hdr_metadata = false;  // #106
+    // Only with vulkan_pipeline_statistics.
+    bool ext_KHR_pipeline_executable_properties = false;  // #270
+    // Has optional features not implied by this being true.
+    bool ext_KHR_fragment_shading_rate = false;  // #227
+    // Only with vulkan_image_compression_report.
+    bool ext_EXT_image_compression_control = false;  // #339
+  };
+
+  const Extensions& extensions() const { return extensions_; }
+
+  VkDevice device() const { return device_; }
+
+  struct Functions {
+#define XE_UI_VULKAN_FUNCTION(name) PFN_##name name = nullptr;
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  PFN_##core_name core_name = nullptr;
+#include <rex/ui/vulkan/functions/device_1_0.inc>
+    // VK_KHR_swapchain (#2)
+#include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+    // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
+#include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
+    // VK_KHR_bind_memory2 (#158, promoted to 1.1)
+#include <rex/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc>
+    // VK_KHR_maintenance4 (#414, promoted to 1.3)
+#include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+    // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+#include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+    // VK_NV_device_diagnostic_checkpoints (#207)
+#include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
+    // VK_KHR_push_descriptor (#81)
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+    // VK_KHR_present_wait (#249)
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+    // VK_EXT_hdr_metadata (#106)
+#include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
+    // VK_KHR_fragment_shading_rate (#227)
+#include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+#undef XE_UI_VULKAN_FUNCTION
+  };
+
+  const Functions& functions() const { return functions_; }
+
+  // vulkan_image_compression_report: logs, once per kind of image (what,
+  // format, usage, flags, single or several levels), whether the driver
+  // compresses it (Arm AFBC and similar), through
+  // VK_EXT_image_compression_control. Does nothing otherwise.
+  void ReportImageCompression(VkImage image, const VkImageCreateInfo& info,
+                              const char* what) const;
+
+  // vkWaitForFences until the fences signal or the device fails. Waits a
+  // second at a time: an Adreno 830 driver (Snapdragon 8 Elite) returns
+  // VK_TIMEOUT at once for a UINT64_MAX timeout, which callers took for a
+  // failure and treated unfinished submissions as done.
+  VkResult WaitForFences(uint32_t fence_count, const VkFence* fences, VkBool32 wait_all) const {
+    for (;;) {
+      const VkResult result = functions_.vkWaitForFences(device_, fence_count, fences, wait_all,
+                                                         UINT64_C(1000000000));
+      if (result != VK_TIMEOUT) {
+        return result;
+      }
+    }
+  }
+
+  // Debug names for objects (VK_EXT_debug_utils), for capture tools.
+  bool object_names_enabled() const { return object_names_enabled_; }
+
+  template <typename Object>
+  void SetObjectName(const VkObjectType object_type, const Object object_handle,
+                     const char* const object_name) const {
+    if (!object_names_enabled_) {
+      return;
+    }
+    VkDebugUtilsObjectNameInfoEXT object_name_info;
+    object_name_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    object_name_info.pNext = nullptr;
+    object_name_info.objectType = object_type;
+    object_name_info.objectHandle = (uint64_t)object_handle;
+    object_name_info.pObjectName = object_name;
+    vulkan_instance()->functions().vkSetDebugUtilsObjectNameEXT(device(), &object_name_info);
+  }
+
+  struct Queue {
+    // Host access to queues must be externally synchronized in Vulkan.
+    std::recursive_mutex mutex;
+    VkQueue queue = nullptr;
+
+    explicit Queue(const VkQueue queue) : queue(queue) {}
+
+    class Acquisition {
+     public:
+      explicit Acquisition(Queue& queue) : lock_(queue.mutex), queue_(queue.queue) {}
+
+      VkQueue queue() const { return queue_; }
+
+     private:
+      std::unique_lock<std::recursive_mutex> lock_;
+      VkQueue queue_;
+    };
+
+    Acquisition Acquire() { return Acquisition(*this); }
+  };
+
+  struct QueueFamily {
+    VkQueueFlags queue_flags = 0;
+    bool may_support_presentation = false;
+    std::vector<std::unique_ptr<Queue>> queues;
+  };
+
+  const std::vector<QueueFamily>& queue_families() const { return queue_families_; }
+  uint32_t queue_family_graphics_compute() const { return queue_family_graphics_compute_; }
+  // UINT32_MAX if not supported or not enabled.
+  // May be the same as queue_family_graphics_compute().
+  uint32_t queue_family_sparse_binding() const { return queue_family_sparse_binding_; }
+
+  Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
+                                  const uint32_t queue_index) const {
+    return queue_families()[queue_family_index].queues[queue_index]->Acquire();
+  }
+
+  struct MemoryTypes {
+    uint32_t device_local = 0b0;
+    uint32_t host_visible = 0b0;
+    uint32_t host_coherent = 0b0;
+    uint32_t host_cached = 0b0;
+  };
+
+  const MemoryTypes& memory_types() const { return memory_types_; }
+
+ private:
+  explicit VulkanDevice(const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device);
+
+  const VulkanInstance* vulkan_instance_ = nullptr;
+  VkPhysicalDevice physical_device_ = nullptr;
+
+  Properties properties_;
+  Extensions extensions_;
+
+  VkDevice device_ = nullptr;
+
+  Functions functions_;
+
+  bool object_names_enabled_ = false;
+
+  std::vector<QueueFamily> queue_families_;
+  uint32_t queue_family_graphics_compute_ = UINT32_MAX;
+  uint32_t queue_family_sparse_binding_ = UINT32_MAX;
+
+  MemoryTypes memory_types_;
+
+  mutable std::mutex image_compression_reported_mutex_;
+  mutable std::vector<uint64_t> image_compression_reported_;
+};
+
+}  // namespace vulkan
+}  // namespace ui
+}  // namespace rex

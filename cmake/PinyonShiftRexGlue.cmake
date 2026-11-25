@@ -189,6 +189,9 @@ if(REXSDK_DIR)
     set(REXGLUE_OUTPUT_DIRECTORY
         "${CMAKE_CURRENT_BINARY_DIR}/rexglue-artifacts"
         CACHE PATH "ReXGlue artifacts for the Pinyon Shift host build" FORCE)
+    if(IOS)
+        set(REXGLUE_ENABLE_FIDELITYFX OFF CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory("${REXSDK_DIR}" rexglue-sdk EXCLUDE_FROM_ALL)
     # NN-3.6: calls inside the runtime libraries bind locally instead of
     # through the PLT, as libmain's already do. Nothing interposes on their

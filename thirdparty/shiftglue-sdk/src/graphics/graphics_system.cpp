@@ -1,0 +1,643 @@
+#include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+
+#include <rex/graphics/graphics_system.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
+
+#include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/kernel/xboxkrnl/video.h>
+#include <rex/logging.h>
+#include <rex/perf/counter.h>
+#include <rex/stream.h>
+#include <rex/system/gpu_plugin.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
+#include <rex/ui/graphics_provider.h>
+#include <rex/ui/flags.h>
+#include <rex/ui/window.h>
+#include <rex/ui/windowed_app_context.h>
+
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+    .allowed({"none", "fxaa", "fxaa_extreme"});
+REXCVAR_DEFINE_BOOL(swap_post_effect_scene_only, true, "GPU",
+                    "Vulkan: apply the swap post effect to the scene only, not to the HUD drawn "
+                    "over it (no effect where the frame has no scene)");
+REXCVAR_DEFINE_STRING(scene_lut_path, "", "GPU",
+                      "Vulkan: a .cube 3D colour LUT applied to the scene, not the HUD; empty "
+                      "for none");
+REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
+                     "Vulkan: how much of the scene LUT applies, in percent")
+    .range(0, 100);
+REXCVAR_DEFINE_BOOL(swap_ambient_occlusion, false, "GPU",
+                    "Vulkan FH1 executor: screen-space ambient occlusion from the scene's depth, "
+                    "applied at swap to the scene only (not the HUD)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(swap_ambient_occlusion_strength, 70, "GPU",
+                     "Vulkan: how dark ambient occlusion can make a pixel, in percent")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(swap_ambient_occlusion_debug, false, "GPU",
+                    "Vulkan: show only the ambient occlusion term, white for none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(swap_ambient_occlusion_radius, 1.0, "GPU",
+                      "Vulkan: ambient occlusion radius in the title's world units (metres in "
+                      "FH1 and FH2)")
+    .range(0.1, 10.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                    "Store shaders persistently and load them when loading games to avoid "
+                    "runtime spikes and freezes when playing the game not for the first time.");
+REXCVAR_DEFINE_UINT32(
+    pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
+    "FH1 source-render FPS limit (0 follows the host display; up to 1000 for an "
+    "effectively unlocked rate)")
+    .range(0, 1000);
+REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
+                    "Log the first guest read of each GPU register (a census of what the "
+                    "title polls, for deciding which reads need emulation)");
+REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
+                    "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+
+constexpr double Fh1GuestVblankHzForRenderLimit(uint32_t render_fps_limit,
+                                                double display_refresh_hz) {
+  return (render_fps_limit ? double(render_fps_limit) : display_refresh_hz) *
+         2.0;
+}
+
+static_assert(Fh1GuestVblankHzForRenderLimit(0, 144.0) == 288.0);
+static_assert(Fh1GuestVblankHzForRenderLimit(60, 144.0) == 120.0);
+
+rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+    const std::string& effect_name) {
+  std::string lowered = effect_name;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+    c = static_cast<unsigned char>(std::tolower(c));
+    return c == '-' ? '_' : char(c);
+  });
+  if (lowered == "fxaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kFxaa;
+  }
+  if (lowered == "fxaa_extreme" || lowered == "extreme") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
+  }
+  return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
+}
+
+// The present_* cvars BuildGuestOutputPaintConfigFromCVar reads.
+constexpr const char* kPresenterPaintCvars[] = {
+    "present_effect",
+    "present_cas_additional_sharpness",
+    "present_fsr_max_upsampling_passes",
+    "present_fsr_sharpness_reduction",
+    "present_fsr_quality_mode",
+    "present_dither",
+    "present_allow_overscan_cutoff",
+};
+}  // namespace
+
+namespace rex::graphics {
+
+// Nvidia Optimus/AMD PowerXpress support.
+// These exports force the process to trigger the discrete GPU in multi-GPU
+// systems.
+// https://developer.download.nvidia.com/devzone/devcenter/gamegraphics/files/OptimusRenderingPolicies.pdf
+// https://stackoverflow.com/questions/17458803/amd-equivalent-to-nvoptimusenablement
+#if REX_PLATFORM_WIN32
+extern "C" {
+__declspec(dllexport) uint32_t NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
+}  // extern "C"
+#endif  // REX_PLATFORM_WIN32
+
+GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+
+GraphicsSystem::~GraphicsSystem() = default;
+
+X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
+  if (presenter_) {
+    return X_STATUS_SUCCESS;
+  }
+
+  if (!provider_) {
+    CreateProvider(true);
+    if (!provider_) {
+      REXGPU_ERROR("Unable to create graphics provider");
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    provider_supports_presentation_ = true;
+  } else if (!provider_supports_presentation_) {
+    // A prior SetupGuestGpu built a headless provider; backends like Vulkan
+    // need swapchain support baked in at provider creation time.
+    REXGPU_ERROR("SetupPresentation called after headless SetupGuestGpu; call order is reversed");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  app_context_ = app_context;
+  auto loss_cb = [this](bool is_responsible, bool statically_from_ui_thread) {
+    OnHostGpuLossFromAnyThread(is_responsible);
+  };
+  if (app_context_) {
+    // Presenter creation must happen on the UI thread.
+    app_context_->CallInUIThreadSynchronous(
+        [this, loss_cb]() { presenter_ = provider_->CreatePresenter(loss_cb); });
+  } else {
+    // Offscreen path (e.g. capturing guest output without a window).
+    presenter_ = provider_->CreatePresenter(loss_cb);
+  }
+
+  if (!presenter_) {
+    REXGPU_ERROR("Unable to create presenter");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // The output scaling, sharpening and overscan settings apply from the next
+  // paint (the letterbox is read by every paint already).
+  if (app_context_) {
+    for (const char* name : kPresenterPaintCvars) {
+      cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
+        // Deferred: the callback runs under the cvar registry lock.
+        app_context_->CallInUIThreadDeferred([this] {
+          if (presenter_) {
+            presenter_->RefreshGuestOutputPaintConfigFromUIThread();
+          }
+        });
+      });
+    }
+  }
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
+                                       system::KernelState* kernel_state) {
+  memory_ = function_dispatcher->memory();
+  function_dispatcher_ = function_dispatcher;
+  kernel_state_ = kernel_state;
+
+  // Headless path: no one set up presentation, so build a no-presentation
+  // provider just for the command processor.
+  if (!provider_) {
+    CreateProvider(false);
+    provider_supports_presentation_ = false;
+  }
+
+  // Create command processor. This will spin up a thread to process all
+  // incoming ringbuffer packets.
+  command_processor_ = CreateCommandProcessor();
+  if (!command_processor_->Initialize()) {
+    REXGPU_ERROR("Unable to initialize command processor");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  // The post effect is applied per swap, so a change takes effect at once.
+  cvar::RegisterChangeCallback("swap_post_effect", [this](std::string_view, std::string_view value) {
+    if (command_processor_) {
+      command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(std::string(value)));
+    }
+  });
+
+  // Register GPU MMIO handlers
+  // GPU registers are at 0x7FC80000-0x7FCFFFFF
+  memory_->AddVirtualMappedRange(0x7FC80000,  // base address
+                                 0xFFFF0000,  // mask
+                                 0x0000FFFF,  // size (64KB)
+                                 this,        // context (GraphicsSystem*)
+                                 reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
+                                 reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
+
+  // Guest vblank timer based on the configured guest video mode.
+  vsync_worker_running_ = true;
+  vsync_worker_thread_ = system::object_ref<system::XHostThread>(
+      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        if (cs_scheduler::Enabled()) {
+          cs_scheduler::Actor scheduled(cs_scheduler::kVblank);
+          const uint64_t period = 1000000000 / uint64_t(Fh1GuestVblankHzForRenderLimit(
+              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit), REXCVAR_GET(video_mode_refresh_rate)));
+          uint64_t next = cs_scheduler::Now() + period;
+          while (vsync_worker_running_) {
+            while (cs_scheduler::Now() >= next) { MarkVblank(); next += period; }
+            cs_scheduler::Point(0, cs_scheduler::PointKind::kWait, true, next - cs_scheduler::Now());
+          }
+          return 0;
+        }
+        if (session_probe::Enabled()) session_probe::SetHostRole(2);
+        system::X_VIDEO_MODE video_mode;
+        kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+        // FH1 waits for two guest vblanks per rendered frame. Follow the
+        // detected host refresh by default so completed source frames arrive
+        // at the cadence the display can actually consume. The limit is read
+        // every tick so the in-game settings change it live. Host vsync only
+        // changes presentation: FH1 steps its simulation once per two
+        // vblanks, so the old 1 kHz vblank without vsync ran 500 simulation
+        // steps a second, and where a step is expensive (race central's
+        // paused screens) each frame spanned ever more vblanks.
+        uint32_t render_fps_limit = UINT32_MAX;
+        uint64_t interval_ticks = 1;
+        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        while (vsync_worker_running_) {
+          if (chrono::Clock::guest_time_paused()) {
+            // Guest time stands still in the background: no vblank is due.
+            rex::thread::Sleep(std::chrono::milliseconds(20));
+            continue;
+          }
+          uint32_t current_render_fps_limit = REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+          // UP-4.2: with a generated frame after each real one, the game
+          // renders at no more than half the refresh, so both are shown.
+          if (presenter_ && presenter_->IsFrameGenerating()) {
+            const uint32_t half_refresh =
+                uint32_t(REXCVAR_GET(video_mode_refresh_rate) * 0.5 + 0.5);
+            if (half_refresh &&
+                (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
+              current_render_fps_limit = half_refresh;
+            }
+          }
+          if (current_render_fps_limit != render_fps_limit) {
+            render_fps_limit = current_render_fps_limit;
+            const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
+                render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
+            interval_ticks =
+                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+          }
+          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          while (current_time - last_frame_time >= interval_ticks) {
+            if (perf::CriticalPathTraceEnabled()) {
+              const uint64_t late_ticks = current_time - last_frame_time - interval_ticks;
+              perf::TraceCriticalPath(
+                  "guest_vblank_deadline",
+                  perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                  int64_t(double(late_ticks) * 1000000000.0 /
+                          double(guest_tick_frequency)),
+                  int64_t(double(interval_ticks) * 1000000000.0 /
+                          double(guest_tick_frequency)));
+            }
+            MarkVblank();
+            last_frame_time += interval_ticks;
+          }
+          if (!REXCVAR_GET(pinyon_shift_fh1_vblank_deadline_wait)) {
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+            continue;
+          }
+
+          constexpr auto kVblankSpinTime = std::chrono::microseconds(500);
+          constexpr auto kVblankTimerSpinTime = std::chrono::microseconds(50);
+          const uint64_t deadline_ticks = last_frame_time + interval_ticks;
+          const uint64_t remaining_ticks = deadline_ticks - current_time;
+          const double guest_time_scalar = std::max(0.001, chrono::Clock::guest_time_scalar());
+          const auto remaining_time = std::chrono::nanoseconds(std::max<int64_t>(
+              1, int64_t(double(remaining_ticks) * 1000000000.0 /
+                         (double(guest_tick_frequency) * guest_time_scalar))));
+          if (REXCVAR_GET(high_resolution_timer_waits)) {
+            rex::thread::SleepUntil(std::chrono::steady_clock::now() + remaining_time,
+                                    kVblankTimerSpinTime);
+          } else if (remaining_time > kVblankSpinTime) {
+            std::this_thread::sleep_for(remaining_time - kVblankSpinTime);
+          }
+          while (vsync_worker_running_ && !chrono::Clock::guest_time_paused() &&
+                 chrono::Clock::QueryGuestTickCount() < deadline_ticks) {
+            std::this_thread::yield();
+          }
+        }
+        return 0;
+      }));
+  // TODO: set_can_debugger_suspend not yet ported
+  // vsync_worker_thread_->set_can_debugger_suspend(true);
+  vsync_worker_thread_->set_name("GPU VSync");
+  vsync_worker_thread_->Create();
+  vsync_worker_thread_->MarkLatencyCritical();
+
+  return X_STATUS_SUCCESS;
+}
+
+void GraphicsSystem::Shutdown() {
+  cvar::UnregisterChangeCallbacks("swap_post_effect");
+  for (const char* name : kPresenterPaintCvars) {
+    cvar::UnregisterChangeCallbacks(name);
+  }
+  if (command_processor_) {
+    command_processor_->Shutdown();
+    command_processor_.reset();
+  }
+
+  if (vsync_worker_thread_) {
+    vsync_worker_running_ = false;
+    vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+    vsync_worker_thread_.reset();
+  }
+
+  if (presenter_) {
+    if (app_context_) {
+      app_context_->CallInUIThreadSynchronous([this]() { presenter_.reset(); });
+    }
+    // If there's no app context (thus the presenter is owned by the thread that
+    // initialized the GraphicsSystem) or can't be queueing UI thread calls
+    // anymore, shutdown anyway.
+    presenter_.reset();
+  }
+
+  provider_.reset();
+}
+
+void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
+  // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
+  // used by the command processor, the presenter, and possibly anything else,
+  // it's considered free-threaded, except for lifetime management which will be
+  // involved in this case) and reset it so a new host GPU API device is
+  // created. Then ask the command processor to reset itself in its thread, and
+  // ask the UI thread to reset the Presenter (the UI thread manages its
+  // lifetime - but if there's no WindowedAppContext, either don't reset it as
+  // in this case there's no user who needs uninterrupted gameplay, or somehow
+  // protect it with a mutex so any thread can be considered a UI thread and
+  // reset).
+  if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
+    return;
+  }
+  system::ReportHostGpuLoss();
+}
+
+uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {
+  const auto value = gs->ReadRegister(addr);
+  return session_probe::Enabled() ? uint32_t(session_probe::Scalar(
+      session_probe::Kind::kMmioRead, addr, value, true)) : value;
+}
+
+void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,
+                                        uint32_t value) {
+  gs->WriteRegister(addr, value);
+}
+
+uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
+  uint32_t r = (addr & 0xFFFF) / 4;
+
+  if (REXCVAR_GET(gpu_log_register_reads)) {
+    static std::atomic<bool> seen[RegisterFile::kRegisterCount];
+    if (r < RegisterFile::kRegisterCount && !seen[r].exchange(true)) {
+      const auto* info = register_file_.GetRegisterInfo(r);
+      REXGPU_INFO("GPU: register.first_read {:04X} {}", r, info ? info->name : "?");
+    }
+  }
+
+  switch (r) {
+    case 0x0F00:  // RB_EDRAM_TIMING
+      return 0x08100748;
+    case 0x0F01:  // RB_BC_CONTROL
+      return 0x0000200E;
+    case 0x194C: {  // R500_D1MODE_V_COUNTER
+      system::X_VIDEO_MODE video_mode;
+      kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+      return std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+    }
+    case 0x1951:    // interrupt status
+      return 1;     // vblank
+    case 0x1961: {  // AVIVO_D1MODE_VIEWPORT_SIZE
+      // Maximum [width(0x0FFF), height(0x0FFF)].
+      system::X_VIDEO_MODE video_mode;
+      kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+      uint32_t viewport_width = std::min(uint32_t(video_mode.display_width), uint32_t(0x0FFF));
+      uint32_t viewport_height = std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+      return (viewport_width << 16) | viewport_height;
+    }
+    default:
+      if (!register_file_.GetRegisterInfo(r)) {
+        REXGPU_DEBUG("GPU: Read from unknown register ({:04X})", r);
+      }
+  }
+
+  assert_true(r < RegisterFile::kRegisterCount);
+  return register_file_.values[r];
+}
+
+void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
+  uint32_t r = (addr & 0xFFFF) / 4;
+
+  switch (r) {
+    case 0x01C5:  // CP_RB_WPTR
+      command_processor_->UpdateWritePointer(value);
+      break;
+    case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
+      break;
+    default:
+      REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+      break;
+  }
+
+  assert_true(r < RegisterFile::kRegisterCount);
+  register_file_.values[r] = value;
+}
+
+void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  command_processor_->InitializeRingBuffer(ptr, size_log2);
+}
+
+void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+  command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
+}
+
+void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
+  interrupt_callback_ = callback;
+  interrupt_callback_data_ = user_data;
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kCallbackRegistration, callback, user_data);
+    session_interrupt_callback_.store((uint64_t(callback) << 32) | user_data,
+                                      std::memory_order_release);
+  }
+  REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
+}
+
+void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+  uint32_t callback = interrupt_callback_, callback_data = interrupt_callback_data_;
+  if (session_probe::Enabled()) {
+    const auto expected = session_probe::Scalar(session_probe::Kind::kInterruptDelivery,
+        (uint64_t(source) << 32) | cpu,
+        session_interrupt_callback_.load(std::memory_order_acquire), true);
+    callback = uint32_t(expected >> 32); callback_data = uint32_t(expected);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (expected && session_interrupt_callback_.load(std::memory_order_acquire) != expected) {
+      session_probe::Require(std::chrono::steady_clock::now() < deadline,
+          "capture incomplete: interrupt callback publication was not reached");
+      std::this_thread::yield();
+    }
+  }
+  if (!callback) {
+    return;
+  }
+
+  auto thread = system::XThread::GetCurrentThread();
+  assert_not_null(thread);
+
+  // Pick a CPU, if needed. We're going to guess 2. Because.
+  if (cpu == 0xFFFFFFFF) {
+    cpu = 2;
+  }
+  thread->SetActiveCpu(cpu);
+
+  // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
+  //          interrupt_callback_, source, cpu);
+
+  uint64_t args[] = {source, callback_data};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args,
+                                         rex::countof(args));
+}
+
+void GraphicsSystem::MarkVblank() {
+  if (session_probe::Enabled()) session_probe::Delivery(session_probe::Kind::kVblankDelivery, 0, 0);
+  // TODO: Enable profiling once ported
+  // SCOPE_profile_cpu_f("gpu");
+
+  using VblankClock = std::chrono::steady_clock;
+  static std::atomic<int64_t> last_vblank_ns{0};
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             VblankClock::now().time_since_epoch())
+                             .count();
+  const int64_t previous_ns = last_vblank_ns.exchange(now_ns, std::memory_order_relaxed);
+  PROFILE_GUEST_VBLANK();
+  if (previous_ns) {
+    PROFILE_GUEST_VBLANK_DELTA_NS(now_ns - previous_ns);
+  }
+
+  const auto dispatch_begin = perf::CriticalPathTraceEnabled()
+                                  ? VblankClock::now()
+                                  : VblankClock::time_point{};
+  // Increment vblank counter (so the game sees us making progress).
+  if (command_processor_) {
+    command_processor_->increment_counter();
+  }
+
+  // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+  //     something wrong and the CP will block waiting for code that
+  //     needs to be run in the interrupt.
+  DispatchInterruptCallback(0, 2);
+  if (perf::CriticalPathTraceEnabled()) {
+    perf::TraceCriticalPath(
+        "guest_vblank_dispatch",
+        perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(VblankClock::now() -
+                                                             dispatch_begin)
+            .count());
+  }
+}
+
+void GraphicsSystem::ClearCaches() {
+  command_processor_->CallInThread([&]() { command_processor_->ClearCaches(); });
+}
+
+void GraphicsSystem::InvalidateGpuMemory() {
+  command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
+}
+
+uint32_t GraphicsSystem::draw_resolution_scale() const {
+  return command_processor_ ? command_processor_->draw_resolution_scale() : 0;
+}
+
+std::shared_ptr<Fh1FrameInspector> GraphicsSystem::frame_inspector() const {
+  return command_processor_ ? command_processor_->frame_inspector() : nullptr;
+}
+
+bool GraphicsSystem::OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) {
+  return command_processor_ && command_processor_->OpenInspectionDump(path, view);
+}
+
+bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,
+                                     uint32_t* resolves) const {
+  return command_processor_ && command_processor_->fh1_shadow_mask(base, length, resolves);
+}
+
+void GraphicsSystem::set_fh1_scene_size(uint32_t width, uint32_t height) {
+  if (!command_processor_) {
+    REXGPU_WARN("FH1 scene size {}x{} set before the command processor exists", width, height);
+    return;
+  }
+  command_processor_->set_fh1_scene_size(width, height);
+}
+
+void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                             uint32_t title_id, bool blocking) {
+  // A requested frame replay runs once the title's shader storage is ready.
+  struct ReplayAfterStorage {
+    CommandProcessor* command_processor;
+    ~ReplayAfterStorage() {
+      command_processor->CallInThread(
+          [command_processor = command_processor] { command_processor->RunRequestedFrameReplay(); });
+    }
+  } replay_after_storage{command_processor_.get()};
+  if (!REXCVAR_GET(store_shaders)) {
+    return;
+  }
+  if (blocking) {
+    if (command_processor_->is_paused()) {
+      // Safe to run on any thread while the command processor is paused, no
+      // race condition.
+      command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+    } else {
+      rex::thread::Fence fence;
+      command_processor_->CallInThread([this, cache_root, title_id, &fence]() {
+        command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+        fence.Signal();
+      });
+      fence.Wait();
+    }
+  } else {
+    command_processor_->CallInThread([this, cache_root, title_id]() {
+      command_processor_->InitializeShaderStorage(cache_root, title_id, false);
+    });
+  }
+}
+
+void GraphicsSystem::Pause() {
+  paused_ = true;
+  command_processor_->Pause();
+}
+
+void GraphicsSystem::Resume() {
+  paused_ = false;
+  command_processor_->Resume();
+}
+
+void GraphicsSystem::ReduceMemory() {
+  // The texture cache runs on the GPU commands thread: it reads the request
+  // there at the next completed submission, or at once if the app is in the
+  // background with the thread paused.
+  TextureCache::RequestMemoryReduction();
+  if (paused_) {
+    command_processor_->ReduceMemoryWhilePaused();
+  }
+}
+
+bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {
+  stream->Write<uint32_t>(interrupt_callback_);
+  stream->Write<uint32_t>(interrupt_callback_data_);
+  return command_processor_->Save(stream);
+}
+
+bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
+  interrupt_callback_ = stream->Read<uint32_t>();
+  interrupt_callback_data_ = stream->Read<uint32_t>();
+  return command_processor_->Restore(stream);
+}
+
+}  // namespace rex::graphics

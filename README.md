@@ -1,4 +1,10 @@
-# Pinyon Shift
+# Pinyon Shift (iOS Fork)
+
+> **iOS / iPadOS Fork Notice:** This is an unofficial iOS / iPadOS fork of
+> **[arcanite24/pinyon-shift](https://github.com)**,
+> adding native `arm64-apple-ios` support (MoltenVK, UIKit/SDL3, ARM64 assembly
+> fibers, and unsigned `.ipa` packaging for LiveContainer / SideStore).
+> See **[docs/IOS.md](docs/IOS.md)** for iOS installation and build instructions.
 
 <p align="center">
   <img src=".github/pinyon-shift-banner.png" alt="Pinyon Shift logo" width="800">

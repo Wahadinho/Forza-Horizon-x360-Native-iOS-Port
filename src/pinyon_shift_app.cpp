@@ -48,7 +48,7 @@
 #include <rex/ui/windowed_app_context.h>
 #include <rex/ui/window.h>
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
 #include <SDL3/SDL_video.h>
 #endif
 
@@ -75,7 +75,7 @@
 #include "ui/achievement_icons.h"
 #include "ui/achievements_menu.h"
 #include "ui/photo_export.h"
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
 #include "ui/frame_inspector.h"
 #endif
 #include "ui/xam_dialogs.h"
@@ -89,7 +89,7 @@
 extern "C" int __llvm_profile_dump(void);
 #endif
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
 REXCVAR_DEFINE_BOOL(fh1_frame_inspector, false, "GPU",
                     "Open the desktop frame inspector on startup (Ctrl+F8 toggles it)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -102,7 +102,7 @@ REXCVAR_DEFINE_INT32(fh1_frame_inspector_view, 0, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
-REXCVAR_DEFINE_BOOL(pinyon_shift_touch_controls, REX_PLATFORM_ANDROID, "Pinyon Shift",
+REXCVAR_DEFINE_BOOL(pinyon_shift_touch_controls, REX_PLATFORM_ANDROID || REX_PLATFORM_IOS, "Pinyon Shift",
                     "On-screen controls for touch screens: a steering stick, throttle, brake "
                     "and buttons, shown on a touch and hidden after a while without one")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -735,6 +735,26 @@ void PinyonShiftApp::OnConfigurePaths(rex::PathConfig& paths) {
   if (auto game_root = diagnostics::EnvironmentPath("PINYON_SHIFT_GAME_ROOT")) {
     paths.game_data_root = *game_root;
   }
+#if REX_PLATFORM_IOS
+  if (paths.game_data_root.empty()) {
+    std::error_code ec;
+    if (const char* home = std::getenv("HOME")) {
+      auto docs_base = std::filesystem::path(home) / "Documents" / "game" / "base";
+      auto docs_game = std::filesystem::path(home) / "Documents" / "game";
+      if (std::filesystem::is_regular_file(docs_base / "default.xex", ec)) {
+        paths.game_data_root = docs_base;
+      } else if (std::filesystem::is_regular_file(docs_game / "default.xex", ec)) {
+        paths.game_data_root = docs_game;
+      }
+    }
+    if (paths.game_data_root.empty()) {
+      auto bundle_game = rex::filesystem::GetExecutableFolder() / "game";
+      if (std::filesystem::is_directory(bundle_game, ec)) {
+        paths.game_data_root = bundle_game;
+      }
+    }
+  }
+#endif
   paths.user_data_root = LongHostPath(state_root / "user");
 #if defined(PINYON_SHIFT_TITLE_UPDATE_V4) && PINYON_SHIFT_TITLE_UPDATE_V4
   // The v4 build's code was generated from the patched executables: load the
@@ -885,7 +905,7 @@ std::optional<rex::PathConfig> PinyonShiftApp::OnFinalizePaths(
   (void)resume;
   auto refresh = pinyon_shift::platform::DisplayRefreshRate(
       window() ? window()->GetNativeWindowHandle() : nullptr);
-#if !defined(_WIN32) && !defined(__ANDROID__)
+#if !defined(_WIN32) && !defined(__ANDROID__) && !REX_PLATFORM_IOS && !REX_PLATFORM_IOS
   // LX-5.5: no native handle off Windows; SDL knows the display's mode (under
   // gamescope, its output's). Android keeps the guest's own 60 Hz.
   if (!refresh) {
@@ -1228,8 +1248,8 @@ void PinyonShiftApp::OpenSettingsMenu() {
   services.achievements = [this] { return CreateAchievementsMenu(); };
   services.save_backups = save_backups_.get();
   services.save_sync = save_sync_.get();
-#if !defined(__ANDROID__)
-  // Android leaves through the system's back and home gestures.
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
+  // Android/iOS leaves through the system's back and home gestures.
   services.quit = [this] { QuitFromMenu(); };
 #endif
   services.mods_root = pinyon_shift::diagnostics::StateRoot() / "mods";
@@ -1303,7 +1323,7 @@ void PinyonShiftApp::ApplyMapView(bool open) {
   pinyon_shift::diagnostics::RecordEvent("display.hor_plus_view", {{"wide", open ? "0" : "1"}});
 }
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
 void PinyonShiftApp::ToggleFrameInspector() {
   if (frame_inspector_ && frame_inspector_->is_open()) {
     frame_inspector_.reset();
@@ -1318,7 +1338,7 @@ void PinyonShiftApp::ToggleFrameInspector() {
 #endif
 
 void PinyonShiftApp::OnPostSetup() {
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   rex::ui::RegisterBind("bind_frame_inspector", "Ctrl+F8", "Toggle the desktop frame inspector",
                         [this] { ToggleFrameInspector(); });
   if (REXCVAR_GET(fh1_frame_inspector) || REXCVAR_GET(fh1_frame_inspector_replay))
@@ -1332,7 +1352,7 @@ void PinyonShiftApp::OnPostSetup() {
     window()->AddListener(&resize_listener_);
     resize_listener_added_ = true;
   }
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   // The pointer hides over the game window after a few idle seconds and
   // comes back when the mouse moves (#1076). Mouse capture hides it and
   // then restores this.
@@ -1932,7 +1952,7 @@ void PinyonShiftApp::OnPostLaunchModule(rex::system::XThread* thread) {
 }
 
 bool PinyonShiftApp::ShouldStartModuleThread() {
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   if (REXCVAR_GET(fh1_frame_inspector_replay)) return false;
 #endif
   // A frame replay drives the GPU on its own; the title stays suspended.
@@ -1992,7 +2012,7 @@ void PinyonShiftApp::PostToast(std::string heading, std::string title, std::stri
 
 void PinyonShiftApp::OnShutdown() {
   pinyon_shift::cvar_cycle::Stop();
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
   rex::ui::UnregisterBind("bind_frame_inspector");
   frame_inspector_.reset();
 #endif
@@ -2055,7 +2075,7 @@ void PinyonShiftApp::QuitFromMenu() {
 void PinyonShiftApp::RecordShutdownOnce() {
   if (!shutdown_recorded_.exchange(true, std::memory_order_acq_rel)) {
     pinyon_shift::diagnostics::RecordEvent("process.shutdown");
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !REX_PLATFORM_IOS
     // Players' data is safe from here. If the SDK's close then stalls (#946:
     // some 0.7.1 closes never reached TerminateTitle), the window stops
     // answering, Windows ends the process as hung (0xCFFFFFFF) and the

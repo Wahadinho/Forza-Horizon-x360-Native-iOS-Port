@@ -3,6 +3,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(pinyon_shift LANGUAGES C CXX)
 
+if(IOS)
+    add_compile_definitions(REX_PLATFORM_IOS=1)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -105,7 +109,7 @@ set(PINYON_SHIFT_HOST_SOURCES
     src/native_renderer/shader_capture.cpp
 )
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT IOS)
     list(APPEND PINYON_SHIFT_HOST_SOURCES src/ui/frame_inspector.cpp)
 endif()
 if(WIN32)

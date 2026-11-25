@@ -243,6 +243,10 @@ const char* Platform() {
   return "windows";
 #elif defined(__ANDROID__)
   return "android";
+#elif REX_PLATFORM_IOS
+  return "ios";
+#elif REX_PLATFORM_IOS
+  return "ios";
 #elif defined(__APPLE__)
   return "macos";
 #else

@@ -1,0 +1,68 @@
+/**
+ * @file        graphics/plugin_main.cpp
+ * @brief       rexgpu-fh1 plugin entry points
+ *
+ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+#include <string_view>
+
+#include <rex/logging.h>
+#include <rex/graphics/null/graphics_system.h>
+#include <rex/system/gpu_plugin.h>
+
+#if REX_HAS_D3D12
+#include <rex/graphics/d3d12/graphics_system.h>
+#endif
+#if REX_HAS_VULKAN
+#include <rex/graphics/vulkan/graphics_system.h>
+#endif
+#if REX_HAS_D3D11
+#include <rex/graphics/d3d11/graphics_system.h>
+#endif
+
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
+  return rex::system::kGpuPluginAbiVersion;
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
+    uint32_t abi_version, const rex::system::GpuCreateInfo* info) {
+  if (abi_version != rex::system::kGpuPluginAbiVersion) {
+    REXLOG_ERROR("rexgpu-fh1: host requested ABI {}, plugin is ABI {}", abi_version,
+                 rex::system::kGpuPluginAbiVersion);
+    return nullptr;
+  }
+  if (!info || info->struct_size < sizeof(rex::system::GpuCreateInfo)) {
+    REXLOG_ERROR("rexgpu-fh1: invalid GpuCreateInfo");
+    return nullptr;
+  }
+
+  std::string_view backend = info->backend ? info->backend : "any";
+  // Only on request: "any" means a backend that draws.
+  if (backend == "null") {
+    return new rex::graphics::null::NullGraphicsSystem();
+  }
+#if REX_HAS_D3D12
+  if (backend == "any" || backend == "d3d12") {
+    return new rex::graphics::d3d12::D3D12GraphicsSystem();
+  }
+#endif
+#if REX_HAS_VULKAN
+  if (backend == "any" || backend == "vulkan") {
+    return new rex::graphics::vulkan::VulkanGraphicsSystem();
+  }
+#endif
+#if REX_HAS_D3D11
+  // Feature level 11_0, for GPUs without Direct3D 12 or Vulkan 1.3. Only on
+  // request: "any" picks the backends above.
+  if (backend == "d3d11") {
+    return new rex::graphics::d3d11::D3D11GraphicsSystem();
+  }
+#endif
+  REXLOG_ERROR("rexgpu-fh1: requested backend '{}' is not compiled into this plugin", backend);
+  return nullptr;
+}

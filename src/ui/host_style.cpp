@@ -27,6 +27,8 @@ std::vector<std::filesystem::path> SystemFontCandidates() {
   candidates.push_back(fonts / "segoeui.ttf");
   candidates.push_back(fonts / "arial.ttf");
 #elif defined(__APPLE__)
+  candidates.push_back("/System/Library/Fonts/Core/HelveticaNeue.ttc");
+  candidates.push_back("/System/Library/Fonts/CoreUI/SFUI.ttf");
   candidates.push_back("/System/Library/Fonts/Supplemental/Arial.ttf");
   candidates.push_back("/Library/Fonts/Arial.ttf");
 #elif defined(__ANDROID__)

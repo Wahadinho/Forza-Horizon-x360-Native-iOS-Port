@@ -1,0 +1,96 @@
+#pragma once
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+
+#include <cstddef>
+#include <functional>
+#include <vector>
+
+#include <rex/input/device.h>
+#include <rex/input/dualsense.h>
+#include <rex/input/input.h>
+#include <rex/kernel.h>
+#include <rex/ui/window.h>
+
+namespace rex::ui {
+class Window;
+}
+
+namespace rex::input {
+
+class InputSystem;
+
+class InputDriver {
+ public:
+  virtual ~InputDriver() = default;
+
+  virtual X_STATUS Setup() = 0;
+
+  /// Devices this driver has open, in its own arrival order. InputSystem
+  /// assigns the cross-driver ordinal, so leave DeviceInfo::ordinal at zero.
+  virtual void EnumerateDevices(std::vector<DeviceInfo>& out) = 0;
+
+  virtual X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) = 0;
+  virtual X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
+                                         X_INPUT_CAPABILITIES* out_caps) = 0;
+  virtual X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) = 0;
+  virtual X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
+                                      X_INPUT_KEYSTROKE* out_keystroke) = 0;
+
+  virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+
+  /// Trigger effects for a pad with DeviceInfo::adaptive_triggers. Drivers
+  /// send only changes, rate-limited; false when the device cannot take them.
+  virtual bool SetDeviceTriggerEffects(DeviceId /*id*/,
+                                       const dualsense::TriggerEffects& /*effects*/) {
+    return false;
+  }
+  /// Lightbar colour, or null for the driver's default (the player colour).
+  virtual bool SetDeviceLightbar(DeviceId /*id*/, const dualsense::Rgb* /*colour*/) {
+    return false;
+  }
+  /// Triggers slack and lightbars back to the player colour on every device
+  /// this driver has open, for good (quit and crash paths). `crashing` asks
+  /// for a path that cannot deadlock on the driver's locks and waits for the
+  /// reports to leave.
+  virtual void ReleaseFeedback(bool /*crashing*/) {}
+
+  void set_is_active_callback(std::function<bool()> is_active_callback) {
+    is_active_callback_ = is_active_callback;
+  }
+
+  // Keyboard-and-mouse emulation rather than a physical pad; host UI pad reads
+  // (InputSystem::GetHostPadState) skip these drivers.
+  virtual bool is_keyboard_and_mouse() const { return false; }
+
+ protected:
+  explicit InputDriver(rex::ui::Window* window, size_t window_z_order)
+      : window_(window), window_z_order_(window_z_order) {}
+
+  rex::ui::Window* window() const { return window_; }
+  size_t window_z_order() const { return window_z_order_; }
+
+  // Guest reads honour the active callback; host UI reads on this thread
+  // (InputSystem::GetHostPadState) always see the live device.
+  bool is_active() const {
+    return host_read_ || !is_active_callback_ || is_active_callback_();
+  }
+
+ private:
+  friend class InputSystem;
+  static inline thread_local bool host_read_ = false;
+
+  rex::ui::Window* window_;
+  size_t window_z_order_;
+  std::function<bool()> is_active_callback_ = nullptr;
+};
+
+}  // namespace rex::input

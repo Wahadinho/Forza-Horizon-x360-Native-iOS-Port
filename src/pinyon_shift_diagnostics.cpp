@@ -168,6 +168,10 @@ std::string ShortCommit(const std::string& commit, const std::string& dirty) {
 constexpr const char* kPlatformName =
 #if defined(__ANDROID__)
     "Android";
+#elif REX_PLATFORM_IOS
+    "iOS";
+#elif REX_PLATFORM_IOS
+    "iOS";
 #elif defined(_WIN32)
     "Windows";
 #elif defined(__APPLE__)
@@ -235,8 +239,16 @@ bool InitializeEarly() {
     return CpuHasSse41();
   }
 
+#if REX_PLATFORM_IOS
+  const char* ios_home = std::getenv("HOME");
+  std::filesystem::path ios_default_state = ios_home
+      ? (std::filesystem::path(ios_home) / "Documents" / "pinyon_shift_state")
+      : (ExecutableDirectory() / "pinyon_shift_state");
+  g_state_root = EnvironmentPath("PINYON_SHIFT_STATE_ROOT").value_or(ios_default_state);
+#else
   g_state_root = EnvironmentPath("PINYON_SHIFT_STATE_ROOT")
                      .value_or(ExecutableDirectory() / "pinyon_shift_state");
+#endif
   g_state_root = std::filesystem::absolute(g_state_root).lexically_normal();
   g_session_id = UtcTimestamp(true) + "-p" + std::to_string(platform::ProcessId());
   g_event_path = g_state_root / "logs" / (g_session_id + ".jsonl");
@@ -251,6 +263,23 @@ bool InitializeEarly() {
       return false;
     }
   }
+#if REX_PLATFORM_IOS
+  {
+    auto bundled_dir = rex::filesystem::GetExecutableFolder() / "shaders" / "shareable";
+    auto dst_dir = g_state_root / "cache" / "shaders" / "shareable";
+    if (std::filesystem::is_directory(bundled_dir, error)) {
+      std::filesystem::create_directories(dst_dir, error);
+      for (const auto& entry : std::filesystem::directory_iterator(bundled_dir, error)) {
+        if (entry.is_regular_file(error)) {
+          auto dst_file = dst_dir / entry.path().filename();
+          if (!std::filesystem::exists(dst_file, error)) {
+            std::filesystem::copy_file(entry.path(), dst_file, std::filesystem::copy_options::skip_existing, error);
+          }
+        }
+      }
+    }
+  }
+#endif
 
   crash::Install(g_state_root / "crashes", g_session_id);
   const std::string features = CpuFeatureSummary();
